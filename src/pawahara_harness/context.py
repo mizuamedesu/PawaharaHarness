@@ -345,27 +345,30 @@ class ContextStore:
         return self._write_json_ready_parent(path, payload)
 
     def _write_json_ready_parent(self, path: Path, payload: Any) -> Path:
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, ensure_ascii=False, indent=2))
-            handle.write("\n")
-        return path
+        return self._write_text_if_changed(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
 
     def _write_json_text_ready_parent(self, path: Path, payload_json: str) -> Path:
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write(payload_json)
-        return path
+        return self._write_text_if_changed(path, payload_json)
 
     def _write_compact_json_ready_parent(self, path: Path, payload: Any) -> Path:
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, ensure_ascii=False, separators=COMPACT_JSON_SEPARATORS))
-            handle.write("\n")
-        return path
+        return self._write_text_if_changed(
+            path,
+            json.dumps(payload, ensure_ascii=False, separators=COMPACT_JSON_SEPARATORS) + "\n",
+        )
 
     def write_text(self, path: Path, content: str) -> Path:
         self._ensure_dir(path.parent)
         return self._write_text_ready_parent(path, content)
 
     def _write_text_ready_parent(self, path: Path, content: str) -> Path:
+        return self._write_text_if_changed(path, content)
+
+    def _write_text_if_changed(self, path: Path, content: str) -> Path:
+        try:
+            if path.exists() and path.read_text(encoding="utf-8") == content:
+                return path
+        except OSError:
+            pass
         with open(path, "w", encoding="utf-8") as handle:
             handle.write(content)
         return path

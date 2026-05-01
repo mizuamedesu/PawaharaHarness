@@ -1,0 +1,111 @@
+name: Build Binaries
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "**"
+    tags:
+      - "v*"
+  pull_request:
+    paths:
+      - ".github/workflows/binaries.yml"
+      - "pyproject.toml"
+      - "scripts/build_binary.py"
+      - "src/**"
+      - "tests/**"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: linux
+            archive: pawahara-harness-linux-x86_64.tar.gz
+            binary: pawahara-harness
+          - os: macos-latest
+            label: macos
+            archive: pawahara-harness-macos.tar.gz
+            binary: pawahara-harness
+          - os: windows-latest
+            label: windows
+            archive: pawahara-harness-windows-x86_64.zip
+            binary: pawahara-harness.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[binary]"
+
+      - name: Build standalone binary
+        run: python scripts/build_binary.py --clean --name pawahara-harness
+
+      - name: Smoke test binary
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            ./dist/pawahara-harness.exe --help
+          else
+            ./dist/pawahara-harness --help
+          fi
+
+      - name: Package Unix binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p release
+          cp "dist/${{ matrix.binary }}" "release/${{ matrix.binary }}"
+          chmod +x "release/${{ matrix.binary }}"
+          tar -czf "${{ matrix.archive }}" -C release "${{ matrix.binary }}"
+
+      - name: Package Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force release | Out-Null
+          Copy-Item "dist/${{ matrix.binary }}" "release/${{ matrix.binary }}"
+          Compress-Archive -Path "release/${{ matrix.binary }}" -DestinationPath "${{ matrix.archive }}" -Force
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pawahara-harness-${{ matrix.label }}
+          path: ${{ matrix.archive }}
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Publish GitHub release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          files=$(find release-artifacts -type f | sort)
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release upload "$TAG_NAME" $files --clobber
+          else
+            gh release create "$TAG_NAME" $files --title "$TAG_NAME" --generate-notes
+          fi

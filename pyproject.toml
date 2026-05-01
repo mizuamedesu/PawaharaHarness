@@ -15,6 +15,9 @@ dependencies = [
 dev = [
   "pytest>=8.0",
 ]
+binary = [
+  "pyinstaller>=6.10",
+]
 codex-sdk = [
   "pydantic>=2.12",
 ]
