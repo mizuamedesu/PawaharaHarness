@@ -8,11 +8,11 @@ from pathlib import Path
 
 from .agents import AgentRuntime, AgentSupervisor, CodexAppServerRuntime, CubeSandboxConfig, CubeSandboxRuntime, LocalCodexRuntime
 from .context import HELM_ROLES, ContextPolicy, ContextStore, HelmDirective, render_helm_context
-from .cube import DEFAULT_TEMPLATE_IMAGE, CubeBootstrapOptions, CubeBootstrapper, CubeDiagnosis
 from .orchestrator import BeamSearchOrchestrator, SearchConfig
 
 
 DEFAULT_CODEX_COMMAND = "codex --ask-for-approval never exec --skip-git-repo-check --sandbox workspace-write"
+DEFAULT_CUBE_TEMPLATE_IMAGE = "ccr.ccs.tencentyun.com/ags-image/sandbox-code:latest"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -78,7 +78,7 @@ def main(argv: list[str] | None = None) -> int:
     cube_up.add_argument("--api-url", default="http://127.0.0.1:3000")
     cube_up.add_argument("--dev-vm-api-url", default="http://127.0.0.1:13000")
     cube_up.add_argument("--template-id")
-    cube_up.add_argument("--template-image", default=DEFAULT_TEMPLATE_IMAGE)
+    cube_up.add_argument("--template-image", default=DEFAULT_CUBE_TEMPLATE_IMAGE)
     cube_up.add_argument("--wait-seconds", type=int, default=900)
     cube_up.add_argument("--no-install", action="store_true")
     cube_up.add_argument("--no-create-template", action="store_true")
@@ -211,6 +211,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command_name == "cube":
         repo_root = Path.cwd()
         if args.cube_command == "status":
+            from .cube import CubeBootstrapOptions, CubeBootstrapper
+
             bootstrapper = CubeBootstrapper(CubeBootstrapOptions(repo_root=repo_root, api_url=args.api_url))
             env = bootstrapper.status()
             if env is None:
@@ -220,6 +222,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.cube_command == "up":
+            from .cube import CubeBootstrapOptions, CubeBootstrapper
+
             bootstrapper = CubeBootstrapper(
                 CubeBootstrapOptions(
                     repo_root=repo_root,
@@ -265,13 +269,15 @@ def add_cube_bootstrap_arguments(parser: argparse.ArgumentParser, *, prefix: str
     parser.add_argument(f"--{prefix}api-url", default="http://127.0.0.1:3000")
     parser.add_argument(f"--{prefix}dev-vm-api-url", default="http://127.0.0.1:13000")
     parser.add_argument(f"--{prefix}template-id")
-    parser.add_argument(f"--{prefix}template-image", default=DEFAULT_TEMPLATE_IMAGE)
+    parser.add_argument(f"--{prefix}template-image", default=DEFAULT_CUBE_TEMPLATE_IMAGE)
     parser.add_argument(f"--{prefix}wait-seconds", type=int, default=900)
     parser.add_argument(f"--{prefix}no-install", action="store_true")
     parser.add_argument(f"--{prefix}no-create-template", action="store_true")
 
 
 def _prepare_cube_backend(args: argparse.Namespace, repo_root: Path) -> CubeDiagnosis | int:
+    from .cube import CubeBootstrapOptions, CubeBootstrapper
+
     bootstrapper = CubeBootstrapper(
         CubeBootstrapOptions(
             repo_root=repo_root,

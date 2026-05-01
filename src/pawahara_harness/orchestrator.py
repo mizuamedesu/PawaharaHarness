@@ -339,6 +339,23 @@ class BeamSearchOrchestrator:
         scheduled: list[tuple[BeamCandidate | None, ThoughtSeed, ManagerDecision]],
         seed_files: dict[str, str | bytes],
     ) -> list[BeamCandidate]:
+        if self.config.max_workers <= 1 or len(scheduled) <= 1:
+            return [
+                self._run_candidate(
+                    run,
+                    goal,
+                    command,
+                    cwd,
+                    depth,
+                    index,
+                    parent,
+                    seed,
+                    manager_decision,
+                    seed_files,
+                )
+                for index, (parent, seed, manager_decision) in enumerate(scheduled)
+            ]
+
         results: list[BeamCandidate | None] = [None] * len(scheduled)
         with ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
             futures = {

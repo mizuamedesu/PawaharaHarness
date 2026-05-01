@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 import threading
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -223,19 +225,23 @@ def list_run_files(run_dir: Path) -> list[dict[str, Any]]:
     files: list[dict[str, Any]] = []
     if not run_dir.exists():
         return files
-    for path in sorted(item for item in run_dir.rglob("*") if item.is_file()):
-        try:
-            stat = path.stat()
-        except OSError:
-            continue
-        files.append(
-            {
-                "path": str(path),
-                "relative_path": str(path.relative_to(run_dir)),
-                "size": stat.st_size,
-                "mtime": stat.st_mtime,
-            }
-        )
+    run_dir_text = os.fspath(run_dir)
+    for dirpath, _dirnames, filenames in os.walk(run_dir_text):
+        for filename in filenames:
+            path_text = os.path.join(dirpath, filename)
+            try:
+                path_stat = os.stat(path_text)
+            except OSError:
+                continue
+            files.append(
+                {
+                    "path": path_text,
+                    "relative_path": os.path.relpath(path_text, run_dir_text),
+                    "size": path_stat.st_size,
+                    "mtime": path_stat.st_mtime,
+                }
+            )
+    files.sort(key=lambda item: item["path"])
     return files
 
 
@@ -293,6 +299,7 @@ def build_nodes_and_edges(
     node_order: list[str] = []
     edges: list[dict[str, str]] = []
     edge_keys: set[tuple[str, str]] = set()
+    file_cache: dict[tuple[str, str | None], dict[str, Any] | None] = {}
 
     def upsert(node_id: str, **fields: Any) -> dict[str, Any]:
         node = nodes.setdefault(node_id, {"id": node_id})
@@ -318,7 +325,7 @@ def build_nodes_and_edges(
         body=short_text(str(run_data.get("goal", "")), 2000),
         meta={"created_at": run_data.get("created_at", "")},
         details={"run": run_data},
-        files=existing_files(run_dir / "run.json", run_dir / "events.jsonl", run_dir / "result.json"),
+        files=existing_files(run_dir / "run.json", run_dir / "events.jsonl", run_dir / "result.json", cache=file_cache),
     )
 
     for event in events:
@@ -335,7 +342,7 @@ def build_nodes_and_edges(
                 body="thinking",
                 meta=payload,
                 details={"event": event},
-                files=files_from_payload(payload),
+                files=files_from_payload(payload, cache=file_cache),
             )
             add_edge(worker_node_id(parent) if parent else "user", key)
         elif kind == "manager.decision":
@@ -349,7 +356,7 @@ def build_nodes_and_edges(
                 body=short_text(role_body(decision, ("directive", "rationale", "context_to_keep")), 2400),
                 meta=payload,
                 details={"event": event, "decision": decision},
-                files=files_from_payload(payload),
+                files=files_from_payload(payload, cache=file_cache),
             )
             parent = payload.get("parent")
             add_edge(worker_node_id(parent) if parent else "user", key)
@@ -363,7 +370,7 @@ def build_nodes_and_edges(
                 body=short_text(str(payload.get("rationale", "")), 1600),
                 meta=payload,
                 details={"event": event},
-                files=files_from_payload(payload),
+                files=files_from_payload(payload, cache=file_cache),
             )
             parent = payload.get("parent")
             add_edge(worker_node_id(parent) if parent else "user", key)
@@ -377,7 +384,7 @@ def build_nodes_and_edges(
                 body="planning",
                 meta=payload,
                 details={"event": event},
-                files=files_from_payload(payload),
+                files=files_from_payload(payload, cache=file_cache),
             )
             add_edge(manager_node_id(payload), key)
         elif kind == "diversity.plan":
@@ -393,7 +400,7 @@ def build_nodes_and_edges(
                 body=short_text(body, 2400),
                 meta=payload,
                 details={"event": event, "plan": plan},
-                files=files_from_payload(payload),
+                files=files_from_payload(payload, cache=file_cache),
             )
             add_edge(manager_node_id(payload), key)
         elif kind == "worker.started":
@@ -410,7 +417,7 @@ def build_nodes_and_edges(
                 body=short_text(str(seed.get("instruction", "")) if isinstance(seed, dict) else "", 1800),
                 meta=payload,
                 details={"event": event, "seed": seed},
-                files=files_from_payload(payload),
+                files=files_from_payload(payload, cache=file_cache),
             )
             add_edge(diversity_node_id(payload), key)
         elif kind == "worker.invocation":
@@ -432,7 +439,7 @@ def build_nodes_and_edges(
                 body="checking completion",
                 meta=payload,
                 details={"event": event},
-                files=files_from_payload(payload),
+                files=files_from_payload(payload, cache=file_cache),
             )
             add_edge("user", key)
         elif kind in {"crow.nudge", "crow.verdict"}:
@@ -446,7 +453,7 @@ def build_nodes_and_edges(
                 body=short_text(role_body(verdict, ("message", "reason")), 1800),
                 meta=payload,
                 details={"event": event, "verdict": verdict},
-                files=files_from_payload(payload),
+                files=files_from_payload(payload, cache=file_cache),
             )
             add_edge("user", key)
 
@@ -460,7 +467,7 @@ def build_nodes_and_edges(
         details = dict(existing.get("details") or {})
         details["candidate"] = candidate
         file_items = list(existing.get("files") or [])
-        file_items.extend(files_from_candidate(run_dir, candidate))
+        file_items.extend(files_from_candidate(run_dir, candidate, cache=file_cache))
         upsert(
             key,
             type="worker",
@@ -481,11 +488,18 @@ def build_nodes_and_edges(
     return [nodes[node_id] for node_id in node_order], edges
 
 
-def existing_files(*paths: Path) -> list[dict[str, Any]]:
-    return [item for path in paths if (item := file_item(path)) is not None]
+def existing_files(
+    *paths: Path,
+    cache: dict[tuple[str, str | None], dict[str, Any] | None] | None = None,
+) -> list[dict[str, Any]]:
+    return [item for path in paths if (item := file_item(path, cache=cache)) is not None]
 
 
-def files_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+def files_from_payload(
+    payload: dict[str, Any],
+    *,
+    cache: dict[tuple[str, str | None], dict[str, Any] | None] | None = None,
+) -> list[dict[str, Any]]:
     files: list[dict[str, Any]] = []
     for key, label in (
         ("prompt_path", "prompt"),
@@ -493,45 +507,67 @@ def files_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
     ):
         path_text = payload.get(key)
         if isinstance(path_text, str) and path_text:
-            item = file_item(Path(path_text), label=label)
+            item = file_item(Path(path_text), label=label, cache=cache)
             if item:
                 files.append(item)
     return files
 
 
-def files_from_candidate(run_dir: Path, candidate: dict[str, Any]) -> list[dict[str, Any]]:
-    files = files_from_payload(candidate)
+def files_from_candidate(
+    run_dir: Path,
+    candidate: dict[str, Any],
+    *,
+    cache: dict[tuple[str, str | None], dict[str, Any] | None] | None = None,
+) -> list[dict[str, Any]]:
+    files = files_from_payload(candidate, cache=cache)
     candidate_id = str(candidate.get("id", ""))
     if candidate_id:
-        item = file_item(run_dir / "candidates" / f"{candidate_id}.json", label="candidate.json")
+        item = file_item(run_dir / "candidates" / f"{candidate_id}.json", label="candidate.json", cache=cache)
         if item:
             files.append(item)
     for artifact in candidate.get("artifacts", []) or []:
         if isinstance(artifact, str) and artifact:
-            item = file_item(Path(artifact), label="artifact")
+            item = file_item(Path(artifact), label="artifact", cache=cache)
             if item:
                 files.append(item)
     return dedupe_files(files)
 
 
-def file_item(path: Path, *, label: str | None = None) -> dict[str, Any] | None:
-    if not path.exists() or not path.is_file():
-        return None
+def file_item(
+    path: Path,
+    *,
+    label: str | None = None,
+    cache: dict[tuple[str, str | None], dict[str, Any] | None] | None = None,
+) -> dict[str, Any] | None:
+    cache_key = (str(path), label)
+    if cache is not None and cache_key in cache:
+        item = cache[cache_key]
+        return dict(item) if item is not None else None
     try:
-        stat = path.stat()
+        path_stat = path.stat()
     except OSError:
+        if cache is not None:
+            cache[cache_key] = None
         return None
-    return {
+    if not stat.S_ISREG(path_stat.st_mode):
+        if cache is not None:
+            cache[cache_key] = None
+        return None
+    item = {
         "label": label or path.name,
         "path": str(path),
-        "size": stat.st_size,
+        "size": path_stat.st_size,
         "preview": read_text_preview(path),
     }
+    if cache is not None:
+        cache[cache_key] = item
+    return dict(item)
 
 
 def read_text_preview(path: Path) -> str:
     try:
-        raw = path.read_bytes()[:MAX_TEXT_PREVIEW_CHARS]
+        with path.open("rb") as handle:
+            raw = handle.read(MAX_TEXT_PREVIEW_CHARS)
     except OSError:
         return ""
     return raw.decode("utf-8", errors="replace")

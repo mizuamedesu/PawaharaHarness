@@ -11,8 +11,6 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Protocol
 from uuid import uuid4
 
-from .cube import ENV_FILE, read_cube_env
-
 
 class CommandResultLike(Protocol):
     stdout: str
@@ -67,6 +65,8 @@ class CubeSandboxConfig:
 
     @classmethod
     def from_env(cls) -> "CubeSandboxConfig":
+        from .cube import ENV_FILE, read_cube_env
+
         saved_env = read_cube_env(Path.cwd() / ENV_FILE)
         for key, value in saved_env.items():
             os.environ.setdefault(key, value)
