@@ -10,6 +10,7 @@ on:
   pull_request:
     paths:
       - ".github/workflows/binaries.yml"
+      - "install.sh"
       - "pyproject.toml"
       - "scripts/build_binary.py"
       - "src/**"
@@ -54,6 +55,10 @@ jobs:
       - name: Build standalone binary
         run: python scripts/build_binary.py --clean --name pawahara-harness
 
+      - name: Validate Linux installer
+        if: runner.os == 'Linux'
+        run: bash -n install.sh
+
       - name: Smoke test binary
         shell: bash
         run: |
@@ -85,6 +90,14 @@ jobs:
         with:
           name: pawahara-harness-${{ matrix.label }}
           path: ${{ matrix.archive }}
+          if-no-files-found: error
+
+      - name: Upload Linux installer artifact
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pawahara-harness-linux-installer
+          path: install.sh
           if-no-files-found: error
 
   release:
