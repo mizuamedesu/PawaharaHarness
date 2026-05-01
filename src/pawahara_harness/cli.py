@@ -33,6 +33,11 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--keep-alive", action="store_true")
     add_cube_bootstrap_arguments(run, prefix="cube-")
 
+    tui = subparsers.add_parser("tui", help="Open the interactive Pawahara Harness TUI.")
+    tui.add_argument("--backend", choices=["codex", "codex-sdk", "cube"], default="codex")
+    tui.add_argument("--goal", default="")
+    tui.add_argument("--command", default=DEFAULT_CODEX_COMMAND)
+
     search = subparsers.add_parser("search", help="Run a context-managed diverse beam search.")
     search.add_argument("--goal")
     search.add_argument("--command", default=DEFAULT_CODEX_COMMAND, help="Command to execute for each worker.")
@@ -116,6 +121,17 @@ def main(argv: list[str] | None = None) -> int:
             }
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0 if result.ok else result.exit_code or 1
+
+    if args.command_name == "tui":
+        from .tui import PawaharaTui, TuiSettings
+
+        return PawaharaTui(
+            TuiSettings(
+                backend=args.backend,
+                goal=args.goal,
+                command=args.command,
+            )
+        ).run_loop()
 
     if args.command_name == "search":
         repo_root = Path.cwd()
