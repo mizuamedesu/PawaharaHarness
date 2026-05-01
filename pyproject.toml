@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pawahara-harness"
+version = "0.1.0"
+description = "Python harness for launching main and sub agents inside CubeSandbox."
+requires-python = ">=3.11"
+dependencies = [
+  "e2b-code-interpreter>=2.4.1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+
+[project.scripts]
+pawahara-harness = "pawahara_harness.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pawahara_harness"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
