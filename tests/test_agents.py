@@ -68,8 +68,8 @@ def test_write_file_command_uses_stable_heredoc() -> None:
 
 def test_agent_shell_command_writes_prompt_and_runs_inside_cwd() -> None:
     command = build_agent_shell_command("codex exec", prompt="do work", cwd="/workspace", env={"A": "b c"})
-    assert "cat > /tmp/pawahara_agent_prompt.txt" in command
-    assert "mkdir -p /workspace && cd /workspace && export A='b c'; codex exec < /tmp/pawahara_agent_prompt.txt" in command
+    assert "cat > /tmp/pawahara_agent_" in command
+    assert "mkdir -p /workspace && cd /workspace && export A='b c'; codex exec < /tmp/pawahara_agent_" in command
 
 
 def test_runtime_runs_agent_and_cleans_up_sandbox() -> None:

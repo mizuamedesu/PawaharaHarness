@@ -3,11 +3,13 @@ from __future__ import annotations
 import os
 import shlex
 import subprocess
+import sys
 import textwrap
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Protocol
+from uuid import uuid4
 
 from .cube import ENV_FILE, read_cube_env
 
@@ -96,6 +98,10 @@ class AgentLaunchSpec:
     seed_files: dict[str, str | bytes] = field(default_factory=dict)
     timeout: int | None = None
     keep_alive: bool = False
+    session_id: str | None = None
+    reuse_session: bool = False
+    model: str | None = None
+    effort: str | None = None
 
 
 @dataclass(frozen=True)
@@ -107,6 +113,7 @@ class AgentResult:
     stdout: str
     stderr: str
     exit_code: int
+    session_id: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -253,6 +260,102 @@ class LocalCodexRuntime:
         )
 
 
+class CodexAppServerRuntime:
+    """Runs agents through the experimental Python Codex app-server SDK."""
+
+    def __init__(self, codex_sdk_src: Path | None = None):
+        self.codex_sdk_src = codex_sdk_src
+
+    def ensure_ready(self) -> None:
+        self._codex_class()
+
+    def run_agent(self, spec: AgentLaunchSpec) -> AgentResult:
+        self._seed_files(spec)
+        try:
+            Codex = self._codex_class()
+            with Codex() as codex:
+                if spec.reuse_session and spec.session_id:
+                    thread = codex.thread_resume(
+                        spec.session_id,
+                        cwd=spec.cwd,
+                        model=spec.model,
+                        config=self._config(spec),
+                    )
+                else:
+                    thread = codex.thread_start(
+                        cwd=spec.cwd,
+                        model=spec.model,
+                        config=self._config(spec),
+                    )
+                result = thread.run(spec.prompt, cwd=spec.cwd, effort=spec.effort, model=spec.model)
+                output = result.final_response or ""
+                return AgentResult(
+                    name=spec.name,
+                    role=spec.role,
+                    sandbox_id="codex-sdk",
+                    command="codex_app_server.thread.run",
+                    stdout=output,
+                    stderr="",
+                    exit_code=0,
+                    session_id=thread.id,
+                )
+        except Exception as exc:
+            return AgentResult(
+                name=spec.name,
+                role=spec.role,
+                sandbox_id="codex-sdk",
+                command="codex_app_server.thread.run",
+                stdout="",
+                stderr=str(exc),
+                exit_code=1,
+                session_id=spec.session_id,
+            )
+
+    def _codex_class(self):
+        try:
+            from codex_app_server import Codex
+
+            return Codex
+        except ImportError as first_error:
+            self._ensure_local_sdk_on_path()
+            try:
+                from codex_app_server import Codex
+
+                return Codex
+            except ImportError as second_error:
+                raise RuntimeError(
+                    "codex_app_server is required for the codex-sdk backend. "
+                    "Install with `python3 -m pip install -e codex/sdk/python` "
+                    "or install this project with the `codex-sdk` extra."
+                ) from second_error if second_error else first_error
+
+    def _seed_files(self, spec: AgentLaunchSpec) -> None:
+        for path, content in spec.seed_files.items():
+            target = Path(path)
+            if not target.is_absolute():
+                target = Path(spec.cwd) / target
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if isinstance(content, bytes):
+                target.write_bytes(content)
+            else:
+                target.write_text(content, encoding="utf-8")
+
+    def _ensure_local_sdk_on_path(self) -> None:
+        candidates = []
+        if self.codex_sdk_src:
+            candidates.append(self.codex_sdk_src)
+        candidates.append(Path.cwd() / "codex" / "sdk" / "python" / "src")
+        for path in candidates:
+            if (path / "codex_app_server").exists():
+                sys.path.insert(0, str(path))
+                return
+
+    def _config(self, spec: AgentLaunchSpec) -> dict[str, str] | None:
+        if not spec.effort:
+            return None
+        return {"model_reasoning_effort": spec.effort}
+
+
 class AgentSupervisor:
     def __init__(self, runtime: AgentRuntime):
         self.runtime = runtime
@@ -305,7 +408,7 @@ class AgentSupervisor:
 
 
 def build_agent_shell_command(command: str, *, prompt: str, cwd: str, env: dict[str, str]) -> str:
-    prompt_path = "/tmp/pawahara_agent_prompt.txt"
+    prompt_path = f"/tmp/pawahara_agent_{uuid4().hex}.txt"
     parts = [write_file_command(prompt_path, prompt), build_shell_command(f"{command} < {shlex.quote(prompt_path)}", cwd=cwd, env=env)]
     return "\n".join(parts)
 

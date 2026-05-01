@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "pawahara-harness"
 version = "0.1.0"
-description = "Python harness for launching main and sub agents inside CubeSandbox."
+description = "Context-managed Codex agent search harness with optional CubeSandbox."
 requires-python = ">=3.11"
 dependencies = [
   "e2b-code-interpreter>=2.4.1",
@@ -14,6 +14,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "pytest>=8.0",
+]
+codex-sdk = [
+  "pydantic>=2.12",
 ]
 
 [project.scripts]
@@ -24,4 +27,3 @@ packages = ["src/pawahara_harness"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-

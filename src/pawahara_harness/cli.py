@@ -5,8 +5,10 @@ import json
 import os
 from pathlib import Path
 
-from .agents import AgentSupervisor, CubeSandboxConfig, CubeSandboxRuntime, LocalCodexRuntime
+from .agents import AgentRuntime, AgentSupervisor, CodexAppServerRuntime, CubeSandboxConfig, CubeSandboxRuntime, LocalCodexRuntime
+from .context import ContextPolicy, ContextStore
 from .cube import DEFAULT_TEMPLATE_IMAGE, CubeBootstrapOptions, CubeBootstrapper, CubeDiagnosis
+from .orchestrator import BeamSearchOrchestrator, SearchConfig
 
 
 DEFAULT_CODEX_COMMAND = "codex exec --skip-git-repo-check --sandbox workspace-write --approval-policy never"
@@ -19,12 +21,38 @@ def main(argv: list[str] | None = None) -> int:
     run = subparsers.add_parser("run", help="Run a main agent.")
     run.add_argument("--goal", required=True)
     run.add_argument("--command", default=DEFAULT_CODEX_COMMAND, help="Command to execute for the agent.")
-    run.add_argument("--backend", choices=["codex", "cube"], default="codex")
+    run.add_argument("--backend", choices=["codex", "codex-sdk", "cube"], default="codex")
     run.add_argument("--use-cube", action="store_const", const="cube", dest="backend")
     run.add_argument("--cwd")
+    run.add_argument("--model")
+    run.add_argument("--effort")
     run.add_argument("--seed", action="append", default=[], help="Seed file as sandbox_path=local_path.")
     run.add_argument("--keep-alive", action="store_true")
     add_cube_bootstrap_arguments(run, prefix="cube-")
+
+    search = subparsers.add_parser("search", help="Run a context-managed diverse beam search.")
+    search.add_argument("--goal")
+    search.add_argument("--command", default=DEFAULT_CODEX_COMMAND, help="Command to execute for each worker.")
+    search.add_argument("--backend", choices=["codex", "codex-sdk", "cube"], default="codex")
+    search.add_argument("--use-cube", action="store_const", const="cube", dest="backend")
+    search.add_argument("--cwd")
+    search.add_argument("--seed", action="append", default=[], help="Seed file as sandbox_path=local_path.")
+    search.add_argument("--beam-width", type=int, default=4)
+    search.add_argument("--branch-factor", type=int, default=4)
+    search.add_argument("--max-depth", type=int, default=2)
+    search.add_argument("--max-workers", type=int, default=4)
+    search.add_argument("--no-stop-on-solved", action="store_true")
+    search.add_argument("--no-agentic-roles", action="store_true")
+    search.add_argument("--no-role-sessions", action="store_true")
+    search.add_argument("--role-command", help="Command for manager/diversity agents; defaults to --command.")
+    search.add_argument("--model")
+    search.add_argument("--effort")
+    search.add_argument("--max-parent-context-chars", type=int, default=4000)
+    search.add_argument("--max-worker-context-chars", type=int, default=12000)
+    search.add_argument("--drop-raw-worker-outputs", action="store_true")
+    search.add_argument("--runs-dir", default=".pawahara/runs")
+    search.add_argument("--resume-run", help="Existing run id or run directory to continue.")
+    add_cube_bootstrap_arguments(search, prefix="cube-")
 
     cube = subparsers.add_parser("cube", help="Manage local CubeSandbox startup.")
     cube_sub = cube.add_subparsers(dest="cube_command", required=True)
@@ -55,7 +83,10 @@ def main(argv: list[str] | None = None) -> int:
             cube_diagnosis = cube_result
             runtime = CubeSandboxRuntime(CubeSandboxConfig.from_env())
         else:
-            runtime = LocalCodexRuntime()
+            runtime_or_error = _build_runtime_or_error(args.backend)
+            if isinstance(runtime_or_error, int):
+                return runtime_or_error
+            runtime = runtime_or_error
 
         supervisor = AgentSupervisor(runtime)
         seed_files = _load_seed_files(args.seed)
@@ -65,6 +96,8 @@ def main(argv: list[str] | None = None) -> int:
             cwd=cwd,
             seed_files=seed_files,
             keep_alive=args.keep_alive,
+            model=args.model,
+            effort=args.effort,
         )
         payload = {"backend": args.backend, **result.__dict__}
         if cube_diagnosis:
@@ -73,6 +106,75 @@ def main(argv: list[str] | None = None) -> int:
             }
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0 if result.ok else result.exit_code or 1
+
+    if args.command_name == "search":
+        repo_root = Path.cwd()
+        cwd = args.cwd or ("/workspace" if args.backend == "cube" else str(repo_root))
+        store = ContextStore(Path(args.runs_dir))
+        resume_run = store.load_run(args.resume_run) if args.resume_run else None
+        goal = args.goal or (resume_run.goal if resume_run else None)
+        if not goal:
+            print(
+                json.dumps(
+                    {"ok": False, "error": "`--goal` is required unless `--resume-run` is provided."},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 2
+        cube_diagnosis: CubeDiagnosis | None = None
+        if args.backend == "cube":
+            cube_result = _prepare_cube_backend(args, repo_root)
+            if isinstance(cube_result, int):
+                return cube_result
+            cube_diagnosis = cube_result
+            runtime = CubeSandboxRuntime(CubeSandboxConfig.from_env())
+        else:
+            runtime_or_error = _build_runtime_or_error(args.backend)
+            if isinstance(runtime_or_error, int):
+                return runtime_or_error
+            runtime = runtime_or_error
+
+        seed_files = _load_seed_files(args.seed)
+        orchestrator = BeamSearchOrchestrator(
+            runtime=runtime,
+            store=store,
+            config=SearchConfig(
+                beam_width=args.beam_width,
+                branch_factor=args.branch_factor,
+                max_depth=args.max_depth,
+                max_workers=args.max_workers,
+                stop_on_solved=not args.no_stop_on_solved,
+                agentic_roles=not args.no_agentic_roles,
+                reuse_role_sessions=not args.no_role_sessions,
+                model=args.model,
+                effort=args.effort,
+                context_policy=ContextPolicy(
+                    max_parent_summary_chars=args.max_parent_context_chars,
+                    max_worker_output_chars=args.max_worker_context_chars,
+                    keep_raw_outputs=not args.drop_raw_worker_outputs,
+                ),
+            ),
+            role_command=args.role_command,
+        )
+        result = orchestrator.run(
+            goal=goal,
+            command=args.command,
+            cwd=cwd,
+            seed_files=seed_files,
+            metadata={
+                "backend": args.backend,
+                "cube_diagnosis": (
+                    cube_diagnosis.__dict__
+                    | {"environment": cube_diagnosis.environment.as_env() if cube_diagnosis.environment else None}
+                    if cube_diagnosis
+                    else None
+                ),
+            },
+            resume_run=resume_run,
+        )
+        print(json.dumps({"backend": args.backend, **result.as_dict()}, ensure_ascii=False, indent=2))
+        return 0
 
     if args.command_name == "cube":
         repo_root = Path.cwd()
@@ -108,6 +210,22 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
     return 2
+
+
+def _build_runtime_or_error(backend: str) -> AgentRuntime | int:
+    try:
+        return _build_runtime(backend)
+    except RuntimeError as exc:
+        print(json.dumps({"ok": False, "backend": backend, "error": str(exc)}, ensure_ascii=False, indent=2))
+        return 1
+
+
+def _build_runtime(backend: str) -> AgentRuntime:
+    if backend == "codex-sdk":
+        runtime = CodexAppServerRuntime()
+        runtime.ensure_ready()
+        return runtime
+    return LocalCodexRuntime()
 
 
 def add_cube_bootstrap_arguments(parser: argparse.ArgumentParser, *, prefix: str = "") -> None:
