@@ -225,7 +225,13 @@ class LocalCodexRuntime:
                 )
 
         command = build_agent_shell_command(spec.command, prompt=spec.prompt, cwd=spec.cwd, env=spec.env)
-        result = self._run_raw(command, timeout=spec.timeout)
+        result = self._run_agent_command(
+            spec.command,
+            prompt=spec.prompt,
+            cwd=spec.cwd,
+            env=spec.env,
+            timeout=spec.timeout,
+        )
         return AgentResult(
             name=spec.name,
             role=spec.role,
@@ -244,14 +250,45 @@ class LocalCodexRuntime:
         env: dict[str, str],
         timeout: int | None,
     ) -> LocalCommandResult:
-        return self._run_raw(build_shell_command(command, cwd=cwd, env=env), timeout=timeout)
+        return self._run_raw(command, cwd=cwd, env=env, timeout=timeout)
 
-    def _run_raw(self, command: str, *, timeout: int | None) -> LocalCommandResult:
+    def _run_agent_command(
+        self,
+        command: str,
+        *,
+        prompt: str,
+        cwd: str,
+        env: dict[str, str],
+        timeout: int | None,
+    ) -> LocalCommandResult:
+        return self._run_raw(command, cwd=cwd, env=env, timeout=timeout, input_text=f"{prompt}\n")
+
+    def _run_raw(
+        self,
+        command: str,
+        *,
+        timeout: int | None,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        input_text: str | None = None,
+    ) -> LocalCommandResult:
+        subprocess_env = None
+        if env:
+            subprocess_env = os.environ.copy()
+            subprocess_env.update(env)
+        subprocess_cwd = None
+        if cwd:
+            cwd_path = Path(cwd)
+            cwd_path.mkdir(parents=True, exist_ok=True)
+            subprocess_cwd = str(cwd_path)
         completed = subprocess.run(
             ["bash", "-lc", command],
             text=True,
+            input=input_text,
             capture_output=True,
             timeout=timeout,
+            cwd=subprocess_cwd,
+            env=subprocess_env,
         )
         return LocalCommandResult(
             stdout=completed.stdout,

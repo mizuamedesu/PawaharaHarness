@@ -1,67 +1,42 @@
-from .agents import (
-    AgentLaunchSpec,
-    AgentResult,
-    AgentSupervisor,
-    CodexAppServerRuntime,
-    CubeSandboxConfig,
-    CubeSandboxRuntime,
-    LocalCodexRuntime,
-    NetworkPolicy,
-)
-from .context import (
-    BeamCandidate,
-    ContextPolicy,
-    ContextStore,
-    CrowVerdict,
-    DiversityPlan,
-    HelmDirective,
-    ManagerDecision,
-    RoleState,
-    ThoughtSeed,
-)
-from .orchestrator import BeamSearchOrchestrator, DiversityDirector, SearchConfig, SearchResult
-
-_LAZY_CUBE_EXPORTS = {
-    "CubeBootstrapOptions",
-    "CubeBootstrapper",
-    "CubeDiagnosis",
-    "CubeEnvironment",
+_EXPORT_MODULES = {
+    "AgentLaunchSpec": ".agents",
+    "AgentResult": ".agents",
+    "AgentSupervisor": ".agents",
+    "CodexAppServerRuntime": ".agents",
+    "CubeSandboxConfig": ".agents",
+    "CubeSandboxRuntime": ".agents",
+    "LocalCodexRuntime": ".agents",
+    "NetworkPolicy": ".agents",
+    "BeamCandidate": ".context",
+    "ContextPolicy": ".context",
+    "ContextStore": ".context",
+    "CrowVerdict": ".context",
+    "DiversityPlan": ".context",
+    "HelmDirective": ".context",
+    "ManagerDecision": ".context",
+    "RoleState": ".context",
+    "ThoughtSeed": ".context",
+    "CubeBootstrapOptions": ".cube",
+    "CubeBootstrapper": ".cube",
+    "CubeDiagnosis": ".cube",
+    "CubeEnvironment": ".cube",
+    "BeamSearchOrchestrator": ".orchestrator",
+    "DiversityDirector": ".orchestrator",
+    "SearchConfig": ".orchestrator",
+    "SearchResult": ".orchestrator",
 }
 
-__all__ = [
-    "AgentLaunchSpec",
-    "AgentResult",
-    "AgentSupervisor",
-    "BeamCandidate",
-    "BeamSearchOrchestrator",
-    "CodexAppServerRuntime",
-    "ContextPolicy",
-    "ContextStore",
-    "CrowVerdict",
-    "CubeSandboxConfig",
-    "CubeSandboxRuntime",
-    "HelmDirective",
-    "LocalCodexRuntime",
-    "NetworkPolicy",
-    "DiversityDirector",
-    "DiversityPlan",
-    "ManagerDecision",
-    "RoleState",
-    "SearchConfig",
-    "SearchResult",
-    "ThoughtSeed",
-    "CubeBootstrapOptions",
-    "CubeBootstrapper",
-    "CubeDiagnosis",
-    "CubeEnvironment",
-]
+__all__ = list(_EXPORT_MODULES)
 
 
 def __getattr__(name: str) -> object:
-    if name in _LAZY_CUBE_EXPORTS:
-        from . import cube
+    module_name = _EXPORT_MODULES.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
-        value = getattr(cube, name)
-        globals()[name] = value
-        return value
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from importlib import import_module
+
+    module = import_module(module_name, __name__)
+    value = getattr(module, name)
+    globals()[name] = value
+    return value

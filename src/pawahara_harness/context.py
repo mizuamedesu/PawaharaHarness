@@ -16,6 +16,19 @@ DEFAULT_RUNS_DIR = Path(".pawahara/runs")
 VALID_STATUSES = {"solved", "promising", "dead_end", "blocked"}
 HELM_ROLES = ("main", "subagent", "manager", "diversity", "worker", "crow")
 COMPACT_JSON_SEPARATORS = (",", ":")
+LIVE_FLUSH_EVENT_KINDS = {
+    "run.resumed",
+    "conversation.message",
+    "manager.started",
+    "manager.decision",
+    "manager.stop",
+    "diversity.started",
+    "diversity.plan",
+    "worker.started",
+    "crow.started",
+    "crow.nudge",
+    "crow.verdict",
+}
 
 
 @dataclass(frozen=True)
@@ -278,7 +291,7 @@ class ContextStore:
     def append_event(self, run: RunRecord, kind: str, payload: dict[str, Any]) -> None:
         event = {"ts": now_iso(), "kind": kind, "payload": payload}
         line = json.dumps(event, ensure_ascii=False, separators=COMPACT_JSON_SEPARATORS) + "\n"
-        self._append_event_line(run, line)
+        self._append_event_line(run, line, flush=kind in LIVE_FLUSH_EVENT_KINDS)
 
     def _append_event_json(self, run: RunRecord, kind: str, payload_json: str) -> None:
         line = (
@@ -290,13 +303,15 @@ class ContextStore:
             + payload_json
             + "}\n"
         )
-        self._append_event_line(run, line)
+        self._append_event_line(run, line, flush=kind in LIVE_FLUSH_EVENT_KINDS)
 
-    def _append_event_line(self, run: RunRecord, line: str) -> None:
+    def _append_event_line(self, run: RunRecord, line: str, *, flush: bool = False) -> None:
         with self._event_buffers_lock:
             buffer = self._event_buffers.get(run.root_dir)
         if buffer is not None:
             buffer.append(line)
+            if flush:
+                buffer.flush()
             return
         path = Path(self._event_path_key(run))
         self._ensure_dir(path.parent)
@@ -330,6 +345,11 @@ class ContextStore:
         with open(path, "w", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=False, indent=2))
             handle.write("\n")
+        return path
+
+    def _write_json_text_ready_parent(self, path: Path, payload_json: str) -> Path:
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(payload_json)
         return path
 
     def _write_compact_json_ready_parent(self, path: Path, payload: Any) -> Path:

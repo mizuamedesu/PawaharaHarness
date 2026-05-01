@@ -218,6 +218,52 @@ def test_tui_resume_suggests_previous_runs_and_dispatches_message(tmp_path: Path
     assert ui.settings.goal == "continue from here"
 
 
+def test_tui_resume_unfinished_run_without_message_continues_immediately(tmp_path: Path) -> None:
+    store = ContextStore(tmp_path / "runs")
+    run = store.create_run("finish old task")
+    ui = PawaharaTui()
+    ui.settings.runs_dir = str(store.runs_dir)
+    calls: list[tuple[str | None, str | None]] = []
+    prompts: list[str] = []
+
+    def fake_execute_search(*, resume_message: str | None = None) -> None:
+        calls.append((ui.settings.resume_run, resume_message))
+
+    def fake_prompt(label: str, *_args: object, **_kwargs: object) -> None:
+        prompts.append(label)
+        return None
+
+    ui._execute_search = fake_execute_search  # type: ignore[method-assign]
+    ui._prompt_for_value = fake_prompt  # type: ignore[method-assign]
+
+    assert ui._input_prompt_for_text(f"/resume {run.run_id} ") is None
+    assert ui.handle_backslash(f"/resume {run.run_id}")
+    assert calls == [(run.run_id, None)]
+    assert prompts == []
+    assert ui.settings.goal == "finish old task"
+
+
+def test_tui_resume_finished_run_without_message_still_prompts(tmp_path: Path) -> None:
+    store = ContextStore(tmp_path / "runs")
+    run = store.create_run("finished task")
+    store.write_json(Path(run.root_dir) / "result.json", {"ok": True})
+    ui = PawaharaTui()
+    ui.settings.runs_dir = str(store.runs_dir)
+    calls: list[tuple[str | None, str | None]] = []
+
+    def fake_execute_search(*, resume_message: str | None = None) -> None:
+        calls.append((ui.settings.resume_run, resume_message))
+
+    ui._execute_search = fake_execute_search  # type: ignore[method-assign]
+    ui._prompt_for_value = lambda *_args, **_kwargs: "new turn"  # type: ignore[method-assign]
+
+    prompt = ui._input_prompt_for_text(f"/resume {run.run_id} ")
+    assert prompt is not None
+    assert prompt.label == "resume"
+    assert ui.handle_backslash(f"/resume {run.run_id}")
+    assert calls == [(run.run_id, "new turn")]
+
+
 def test_tui_search_command_is_not_an_alias() -> None:
     ui = PawaharaTui()
     output = io.StringIO()

@@ -3,12 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from dataclasses import asdict
 from pathlib import Path
-
-from .agents import AgentRuntime, AgentSupervisor, CodexAppServerRuntime, CubeSandboxConfig, CubeSandboxRuntime, LocalCodexRuntime
-from .context import HELM_ROLES, ContextPolicy, ContextStore, HelmDirective, render_helm_context
-from .orchestrator import BeamSearchOrchestrator, SearchConfig
 
 
 DEFAULT_CODEX_COMMAND = "codex --ask-for-approval never exec --skip-git-repo-check --sandbox workspace-write"
@@ -87,6 +82,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command_name == "run":
+        from .agents import AgentSupervisor, CubeSandboxConfig, CubeSandboxRuntime
+
         repo_root = Path.cwd()
         cwd = args.cwd or ("/workspace" if args.backend == "cube" else str(repo_root))
         cube_diagnosis: CubeDiagnosis | None = None
@@ -135,6 +132,11 @@ def main(argv: list[str] | None = None) -> int:
         ).run_loop()
 
     if args.command_name == "search":
+        from dataclasses import asdict
+
+        from .context import ContextPolicy, ContextStore
+        from .orchestrator import BeamSearchOrchestrator, SearchConfig
+
         repo_root = Path.cwd()
         cwd = args.cwd or ("/workspace" if args.backend == "cube" else str(repo_root))
         store = ContextStore(Path(args.runs_dir))
@@ -259,6 +261,8 @@ def _build_runtime_or_error(backend: str) -> AgentRuntime | int:
 
 
 def _build_runtime(backend: str) -> AgentRuntime:
+    from .agents import CodexAppServerRuntime, LocalCodexRuntime
+
     if backend == "codex-sdk":
         runtime = CodexAppServerRuntime()
         runtime.ensure_ready()
@@ -343,6 +347,8 @@ def _load_seed_files(entries: list[str]) -> dict[str, bytes]:
 
 
 def _load_helm_directives(inline_entries: list[str], file_entries: list[str]) -> tuple[HelmDirective, ...]:
+    from .context import HelmDirective
+
     directives: list[HelmDirective] = []
     for index, entry in enumerate(inline_entries):
         scopes, content = _split_helm_scoped_value(entry)
@@ -359,6 +365,8 @@ def _load_helm_directives(inline_entries: list[str], file_entries: list[str]) ->
 
 
 def _split_helm_scoped_value(entry: str) -> tuple[tuple[str, ...], str]:
+    from .context import HELM_ROLES
+
     prefix, separator, rest = entry.partition(":")
     if separator:
         scopes = _parse_helm_scopes(prefix)
@@ -368,6 +376,8 @@ def _split_helm_scoped_value(entry: str) -> tuple[tuple[str, ...], str]:
 
 
 def _parse_helm_scopes(prefix: str) -> tuple[str, ...] | None:
+    from .context import HELM_ROLES
+
     aliases: dict[str, tuple[str, ...]] = {
         "all": HELM_ROLES,
         "agent": ("main", "subagent", "worker"),
@@ -392,6 +402,8 @@ def _parse_helm_scopes(prefix: str) -> tuple[str, ...] | None:
 
 
 def _inject_helm_for_role(prompt: str, *, role: str, directives: tuple[HelmDirective, ...]) -> str:
+    from .context import render_helm_context
+
     helm_context = render_helm_context(directives, role)
     if not helm_context:
         return prompt

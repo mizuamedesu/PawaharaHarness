@@ -382,6 +382,12 @@ class PawaharaTui:
             if len(parts) >= 1 and not arg_text.endswith(" "):
                 return None
             if len(parts) >= 1:
+                try:
+                    run = ContextStore(Path(self.settings.runs_dir)).load_run(parts[0])
+                except RuntimeError:
+                    return None
+                if resume_without_message(run):
+                    return None
                 value = parts[1].strip() if len(parts) == 2 else ""
                 return TextPrompt("resume", "Type the next message for this run.", value=value)
             return None
@@ -548,6 +554,12 @@ class PawaharaTui:
             print(str(exc))
             return
         if not message.strip():
+            if resume_without_message(resume_run):
+                self.settings.resume_run = resume_run.run_id
+                self.settings.goal = resume_run.goal
+                print(f"resuming unfinished run: {resume_run.run_id}")
+                self._execute_search(resume_message=None)
+                return
             prompted = self._prompt_for_value(
                 "resume",
                 "Type the next message for this run.",
@@ -567,9 +579,9 @@ class PawaharaTui:
             print("No previous runs found.")
             return None
         if not self._interactive_input_enabled():
-            print("Usage: /resume <run-id> <message>")
+            print("Usage: /resume <run-id> [message]")
             for run in runs:
-                print(f"  {run.run_id}  {run.goal}")
+                print(f"  {run.run_id}  {describe_run_for_resume(run)}")
             return None
         previous_status = self.status_line
         self.status_line = "select resume run"
@@ -929,8 +941,8 @@ class PawaharaTui:
                 [
                     "Commands:",
                     "  /run <instruction>       run the orchestrated harness",
-                    "  /resume                  choose a previous run, then add the next message",
-                    "  /resume <run-id> <msg>   resume a previous run with a new user turn",
+                    "  /resume                  choose a previous run; unfinished runs continue immediately",
+                    "  /resume <run-id> [msg]   continue unfinished runs or add a new user turn",
                     "  /set <key> <value>       set any scalar setting",
                     "  /unset <key>             clear nullable settings like model/cwd/resume-run",
                     "  /toggle <key>            flip a boolean setting",
@@ -1421,10 +1433,34 @@ def format_value(value: Any) -> str:
 
 
 def describe_run_for_resume(run: Any) -> str:
-    status = "finished" if (Path(run.root_dir) / "result.json").exists() else "running"
+    status = resume_run_status(run)
     goal = truncate_for_status(str(run.goal).replace("\n", " "), max_chars=52)
     created = str(run.created_at).replace("T", " ")[:19]
     return f"{status}  {created}  {goal}"
+
+
+def resume_without_message(run: Any) -> bool:
+    return resume_run_status(run) != "finished"
+
+
+def resume_run_status(run: Any) -> str:
+    root = Path(run.root_dir)
+    worker_prompt_ids = worker_artifact_ids(root / "workers", ".prompt.md")
+    candidate_ids = {path.stem for path in (root / "candidates").glob("*.json")} if (root / "candidates").exists() else set()
+    unfinished_workers = worker_prompt_ids - candidate_ids
+    if unfinished_workers:
+        return "interrupted"
+    return "finished" if (root / "result.json").exists() else "interrupted"
+
+
+def worker_artifact_ids(directory: Path, suffix: str) -> set[str]:
+    if not directory.exists():
+        return set()
+    return {
+        path.name[: -len(suffix)]
+        for path in directory.glob(f"*{suffix}")
+        if path.name.endswith(suffix)
+    }
 
 
 def format_cube_diagnosis(diagnosis: CubeDiagnosis) -> dict[str, Any]:

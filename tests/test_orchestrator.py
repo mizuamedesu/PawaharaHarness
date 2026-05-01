@@ -282,6 +282,18 @@ def test_buffered_events_flush_when_worker_runtime_raises(tmp_path: Path) -> Non
     assert [event["kind"] for event in events] == ["run.created", "worker.started"]
 
 
+def test_buffered_events_flush_live_role_start_events(tmp_path: Path) -> None:
+    store = ContextStore(tmp_path / "runs")
+    run = store.create_run("watch live events")
+
+    with store.buffered_events(run, max_lines=64):
+        store.append_event(run, "manager.started", {"depth": 0, "parent": None})
+        events_path = Path(run.root_dir) / "events.jsonl"
+        events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+
+    assert [event["kind"] for event in events] == ["run.created", "manager.started"]
+
+
 def test_empty_response_artifact_preserves_path(tmp_path: Path) -> None:
     store = ContextStore(tmp_path / "runs")
     run = store.create_run("empty responses")

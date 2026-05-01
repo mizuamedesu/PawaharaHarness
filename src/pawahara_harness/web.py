@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 import threading
 from dataclasses import dataclass, field
@@ -14,6 +15,10 @@ from urllib.parse import parse_qs, unquote, urlparse
 DEFAULT_MONITOR_HOST = "127.0.0.1"
 DEFAULT_MONITOR_PORT = 8765
 MAX_TEXT_PREVIEW_CHARS = 4000
+MAX_TEXT_PREVIEW_CACHE_ITEMS = 10000
+
+_TEXT_PREVIEW_CACHE: dict[str, tuple[int, int, str]] = {}
+_TEXT_PREVIEW_CACHE_LOCK = threading.Lock()
 
 
 @dataclass
@@ -130,18 +135,37 @@ def build_monitor_snapshot(runs_dir: Path, *, run_id: str | None = None) -> dict
 
     run_data = read_json(run_dir / "run.json") or {}
     events = read_events(run_dir / "events.jsonl")
-    candidates = read_candidate_files(run_dir / "candidates")
+    candidates, candidate_file_previews = read_candidate_files_with_previews(run_dir / "candidates")
     result_data = read_json(run_dir / "result.json")
     role_states = read_role_states(run_dir / "roles")
     result_exists = (run_dir / "result.json").exists()
-    nodes, edges = build_nodes_and_edges(run_dir, run_data, events, candidates, result_exists=result_exists)
+    nodes, edges = build_nodes_and_edges(
+        run_dir,
+        run_data,
+        events,
+        candidates,
+        candidate_file_previews=candidate_file_previews,
+        result_exists=result_exists,
+    )
     running = sum(1 for node in nodes if node.get("status") == "running")
     completed = sum(1 for node in nodes if node.get("type") == "worker" and node.get("status") != "running")
     run_status = "running" if running else "finished" if result_exists else "running"
+    latest_running_depth = max((node_depth(node) for node in nodes if node.get("type") == "worker" and node.get("status") == "running"), default=None)
+    has_resume = any(str(event.get("kind", "")) == "run.resumed" for event in events)
     for node in nodes:
         if node.get("id") == "user":
             node["status"] = run_status
-            break
+        if node.get("type") == "resume":
+            node["status"] = "running" if run_status == "running" else "done"
+        if (
+            has_resume
+            and run_status == "running"
+            and latest_running_depth is not None
+            and node.get("type") == "worker"
+            and node.get("status") in {"blocked", "dead_end"}
+            and node_depth(node) < latest_running_depth
+        ):
+            node["stale"] = True
     return {
         "ok": True,
         "run": {
@@ -175,7 +199,27 @@ def select_run_dir(runs_dir: Path, *, run_id: str | None = None) -> Path | None:
     run_dirs = [path for path in runs_dir.iterdir() if path.is_dir() and (path / "run.json").exists()]
     if not run_dirs:
         return None
-    return max(run_dirs, key=lambda path: path.stat().st_mtime)
+    return max(run_dirs, key=run_activity_mtime)
+
+
+def run_activity_mtime(run_dir: Path) -> float:
+    paths = [
+        run_dir,
+        run_dir / "run.json",
+        run_dir / "events.jsonl",
+        run_dir / "result.json",
+    ]
+    for dirname in ("workers", "manager", "diversity", "crow", "candidates", "roles"):
+        directory = run_dir / dirname
+        if directory.exists():
+            paths.extend(path for path in directory.glob("*") if path.is_file())
+    latest = 0.0
+    for path in paths:
+        try:
+            latest = max(latest, path.stat().st_mtime)
+        except OSError:
+            continue
+    return latest
 
 
 def read_json(path: Path) -> dict[str, Any] | None:
@@ -205,14 +249,27 @@ def read_events(path: Path) -> list[dict[str, Any]]:
 
 
 def read_candidate_files(candidate_dir: Path) -> list[dict[str, Any]]:
-    if not candidate_dir.exists():
-        return []
-    candidates: list[dict[str, Any]] = []
-    for path in sorted(candidate_dir.glob("*.json")):
-        data = read_json(path)
-        if data:
-            candidates.append(data)
+    candidates, _previews = read_candidate_files_with_previews(candidate_dir)
     return candidates
+
+
+def read_candidate_files_with_previews(candidate_dir: Path) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    if not candidate_dir.exists():
+        return [], {}
+    candidates: list[dict[str, Any]] = []
+    previews: dict[str, str] = {}
+    for path in sorted(candidate_dir.glob("*.json")):
+        path_text = os.fspath(path)
+        try:
+            with open(path_text, encoding="utf-8") as handle:
+                text = handle.read()
+            data = json.loads(text)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(data, dict):
+            candidates.append(data)
+            previews[path_text] = text[:MAX_TEXT_PREVIEW_CHARS]
+    return candidates, previews
 
 
 def read_role_states(role_dir: Path) -> list[dict[str, Any]]:
@@ -231,21 +288,34 @@ def list_run_files(run_dir: Path) -> list[dict[str, Any]]:
     if not run_dir.exists():
         return files
     run_dir_text = os.fspath(run_dir)
-    for dirpath, _dirnames, filenames in os.walk(run_dir_text):
-        for filename in filenames:
-            path_text = os.path.join(dirpath, filename)
+
+    def collect(dirpath: str, relative_dir: str = "") -> None:
+        try:
+            entries = list(os.scandir(dirpath))
+        except OSError:
+            return
+        for entry in entries:
+            if entry.is_dir(follow_symlinks=False):
+                relative_path = os.path.join(relative_dir, entry.name) if relative_dir else entry.name
+                collect(entry.path, relative_path)
+                continue
             try:
-                path_stat = os.stat(path_text)
+                path_stat = entry.stat()
             except OSError:
                 continue
+            if not stat.S_ISREG(path_stat.st_mode):
+                continue
+            relative_path = os.path.join(relative_dir, entry.name) if relative_dir else entry.name
             files.append(
                 {
-                    "path": path_text,
-                    "relative_path": os.path.relpath(path_text, run_dir_text),
+                    "path": entry.path,
+                    "relative_path": relative_path,
                     "size": path_stat.st_size,
                     "mtime": path_stat.st_mtime,
                 }
             )
+
+    collect(run_dir_text)
     files.sort(key=lambda item: item["path"])
     return files
 
@@ -298,18 +368,25 @@ def build_nodes_and_edges(
     events: list[dict[str, Any]],
     candidates: list[dict[str, Any]],
     *,
+    candidate_file_previews: dict[str, str] | None = None,
     result_exists: bool,
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     nodes: dict[str, dict[str, Any]] = {}
     node_order: list[str] = []
+    node_order_seen: set[str] = set()
     edges: list[dict[str, str]] = []
     edge_keys: set[tuple[str, str]] = set()
+    edge_targets_by_source: dict[str, set[str]] = {}
+    renderable_incoming_targets: set[str] = set()
     file_cache: dict[tuple[str, str | None], dict[str, Any] | None] = {}
+    candidate_dir_text = os.fspath(run_dir / "candidates")
 
     def upsert(node_id: str, **fields: Any) -> dict[str, Any]:
         node = nodes.setdefault(node_id, {"id": node_id})
-        if node_id not in node_order:
+        if node_id not in node_order_seen:
             node_order.append(node_id)
+            node_order_seen.add(node_id)
+        renderable_incoming_targets.update(edge_targets_by_source.get(node_id, ()))
         for key, value in fields.items():
             if value is not None:
                 node[key] = value
@@ -320,6 +397,9 @@ def build_nodes_and_edges(
         if key in edge_keys:
             return
         edge_keys.add(key)
+        edge_targets_by_source.setdefault(source, set()).add(target)
+        if source in nodes:
+            renderable_incoming_targets.add(target)
         edges.append({"from": source, "to": target})
 
     upsert(
@@ -333,10 +413,24 @@ def build_nodes_and_edges(
         files=existing_files(run_dir / "run.json", run_dir / "events.jsonl", run_dir / "result.json", cache=file_cache),
     )
 
-    for event in events:
+    for event_index, event in enumerate(events):
         kind = str(event.get("kind", ""))
         payload = event_payload(event)
-        if kind == "manager.started":
+        if kind == "run.resumed":
+            key = resume_node_id(event_index)
+            message = str(payload.get("resume_message", "")).strip()
+            upsert(
+                key,
+                type="resume",
+                title=f"Resume d{payload.get('start_depth', '?')}",
+                status="running",
+                body=short_text(message or "continued without a new user message", 1800),
+                meta=payload,
+                details={"event": event},
+                files=[],
+            )
+            add_edge("user", key)
+        elif kind == "manager.started":
             key = manager_node_id(payload)
             parent = payload.get("parent")
             upsert(
@@ -472,7 +566,14 @@ def build_nodes_and_edges(
         details = dict(existing.get("details") or {})
         details["candidate"] = candidate
         file_items = list(existing.get("files") or [])
-        file_items.extend(files_from_candidate(run_dir, candidate, cache=file_cache))
+        file_items.extend(
+            files_from_candidate(
+                candidate_dir_text,
+                candidate,
+                candidate_file_previews=candidate_file_previews,
+                cache=file_cache,
+            )
+        )
         upsert(
             key,
             type="worker",
@@ -485,7 +586,7 @@ def build_nodes_and_edges(
             files=dedupe_files(file_items),
         )
         parent = candidate.get("parent_id")
-        if has_renderable_incoming_edge(edges, nodes, key):
+        if has_renderable_incoming_edge(renderable_incoming_targets, key):
             continue
         if parent:
             add_edge(worker_node_id(parent), key)
@@ -493,17 +594,25 @@ def build_nodes_and_edges(
             diversity_id = diversity_node_id(candidate)
             add_edge(diversity_id if diversity_id in nodes else "user", key)
 
-    add_prompt_only_worker_nodes(run_dir, nodes, node_order, edges, edge_keys, file_cache)
+    add_prompt_only_worker_nodes(
+        run_dir,
+        nodes,
+        node_order,
+        edges,
+        edge_keys,
+        edge_targets_by_source,
+        renderable_incoming_targets,
+        file_cache,
+    )
 
     return [nodes[node_id] for node_id in node_order], edges
 
 
 def has_renderable_incoming_edge(
-    edges: list[dict[str, str]],
-    nodes: dict[str, dict[str, Any]],
+    renderable_incoming_targets: set[str],
     target: str,
 ) -> bool:
-    return any(edge.get("to") == target and edge.get("from") in nodes for edge in edges)
+    return target in renderable_incoming_targets
 
 
 def add_prompt_only_worker_nodes(
@@ -512,6 +621,8 @@ def add_prompt_only_worker_nodes(
     node_order: list[str],
     edges: list[dict[str, str]],
     edge_keys: set[tuple[str, str]],
+    edge_targets_by_source: dict[str, set[str]],
+    renderable_incoming_targets: set[str],
     file_cache: dict[tuple[str, str | None], dict[str, Any] | None],
 ) -> None:
     worker_dir = run_dir / "workers"
@@ -523,6 +634,9 @@ def add_prompt_only_worker_nodes(
         if key in edge_keys:
             return
         edge_keys.add(key)
+        edge_targets_by_source.setdefault(source, set()).add(target)
+        if source in nodes:
+            renderable_incoming_targets.add(target)
         edges.append({"from": source, "to": target})
 
     for prompt_path in sorted(worker_dir.glob("*.prompt.md")):
@@ -544,12 +658,13 @@ def add_prompt_only_worker_nodes(
             "files": file_items,
         }
         node_order.append(node_id)
-        if not has_renderable_incoming_edge(edges, nodes, node_id):
+        renderable_incoming_targets.update(edge_targets_by_source.get(node_id, ()))
+        if not has_renderable_incoming_edge(renderable_incoming_targets, node_id):
             add_edge("user", node_id)
 
 
 def existing_files(
-    *paths: Path,
+    *paths: str | os.PathLike[str],
     cache: dict[tuple[str, str | None], dict[str, Any] | None] | None = None,
 ) -> list[dict[str, Any]]:
     return [item for path in paths if (item := file_item(path, cache=cache)) is not None]
@@ -567,44 +682,53 @@ def files_from_payload(
     ):
         path_text = payload.get(key)
         if isinstance(path_text, str) and path_text:
-            item = file_item(Path(path_text), label=label, cache=cache)
+            item = file_item(path_text, label=label, cache=cache)
             if item:
                 files.append(item)
     return files
 
 
 def files_from_candidate(
-    run_dir: Path,
+    candidate_dir: str | os.PathLike[str],
     candidate: dict[str, Any],
     *,
+    candidate_file_previews: dict[str, str] | None = None,
     cache: dict[tuple[str, str | None], dict[str, Any] | None] | None = None,
 ) -> list[dict[str, Any]]:
     files = files_from_payload(candidate, cache=cache)
     candidate_id = str(candidate.get("id", ""))
     if candidate_id:
-        item = file_item(run_dir / "candidates" / f"{candidate_id}.json", label="candidate.json", cache=cache)
+        candidate_path_text = os.path.join(os.fspath(candidate_dir), f"{candidate_id}.json")
+        item = file_item(
+            candidate_path_text,
+            label="candidate.json",
+            preview=(candidate_file_previews or {}).get(candidate_path_text),
+            cache=cache,
+        )
         if item:
             files.append(item)
     for artifact in candidate.get("artifacts", []) or []:
         if isinstance(artifact, str) and artifact:
-            item = file_item(Path(artifact), label="artifact", cache=cache)
+            item = file_item(artifact, label="artifact", cache=cache)
             if item:
                 files.append(item)
     return dedupe_files(files)
 
 
 def file_item(
-    path: Path,
+    path: str | os.PathLike[str],
     *,
     label: str | None = None,
+    preview: str | None = None,
     cache: dict[tuple[str, str | None], dict[str, Any] | None] | None = None,
 ) -> dict[str, Any] | None:
-    cache_key = (str(path), label)
+    path_text = os.fspath(path)
+    cache_key = (path_text, label)
     if cache is not None and cache_key in cache:
         item = cache[cache_key]
         return dict(item) if item is not None else None
     try:
-        path_stat = path.stat()
+        path_stat = os.stat(path_text)
     except OSError:
         if cache is not None:
             cache[cache_key] = None
@@ -614,23 +738,44 @@ def file_item(
             cache[cache_key] = None
         return None
     item = {
-        "label": label or path.name,
-        "path": str(path),
+        "label": label or os.path.basename(path_text),
+        "path": path_text,
         "size": path_stat.st_size,
-        "preview": read_text_preview(path),
+        "preview": preview if preview is not None else read_text_preview(path_text, path_stat=path_stat),
     }
     if cache is not None:
         cache[cache_key] = item
     return dict(item)
 
 
-def read_text_preview(path: Path) -> str:
+def read_text_preview(path: str | os.PathLike[str], *, path_stat: os.stat_result | None = None) -> str:
+    path_text = os.fspath(path)
+    if path_stat is None:
+        try:
+            path_stat = os.stat(path_text)
+        except OSError:
+            return ""
+        if not stat.S_ISREG(path_stat.st_mode):
+            return ""
+
+    cache_key = path_text
+    cache_signature = (path_stat.st_mtime_ns, path_stat.st_size)
+    with _TEXT_PREVIEW_CACHE_LOCK:
+        cached = _TEXT_PREVIEW_CACHE.get(cache_key)
+        if cached is not None and cached[:2] == cache_signature:
+            return cached[2]
+
     try:
-        with path.open("rb") as handle:
+        with open(path_text, "rb") as handle:
             raw = handle.read(MAX_TEXT_PREVIEW_CHARS)
     except OSError:
         return ""
-    return raw.decode("utf-8", errors="replace")
+    preview = raw.decode("utf-8", errors="replace")
+    with _TEXT_PREVIEW_CACHE_LOCK:
+        if len(_TEXT_PREVIEW_CACHE) >= MAX_TEXT_PREVIEW_CACHE_ITEMS:
+            _TEXT_PREVIEW_CACHE.clear()
+        _TEXT_PREVIEW_CACHE[cache_key] = (*cache_signature, preview)
+    return preview
 
 
 def dedupe_files(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -672,6 +817,10 @@ def crow_node_id(payload: dict[str, Any]) -> str:
     return f"crow:{payload.get('nudge_index', 0)}"
 
 
+def resume_node_id(event_index: int) -> str:
+    return f"resume:{event_index}"
+
+
 def manager_title(payload: dict[str, Any]) -> str:
     return f"Manager d{payload.get('depth', 0)}"
 
@@ -707,6 +856,23 @@ def short_text(value: str, limit: int) -> str:
     if len(value) <= limit:
         return value
     return value[: max(0, limit - 1)] + "…"
+
+
+def node_depth(node: dict[str, Any]) -> int:
+    meta = node.get("meta")
+    if isinstance(meta, dict):
+        try:
+            return int(meta.get("depth"))
+        except (TypeError, ValueError):
+            pass
+        candidate_id = str(meta.get("candidate", ""))
+    else:
+        candidate_id = ""
+    if not candidate_id:
+        node_id = str(node.get("id", ""))
+        candidate_id = node_id.removeprefix("worker:")
+    match = re.match(r"d(\d+)_w", candidate_id)
+    return int(match.group(1)) if match else 0
 
 
 def render_monitor_page() -> str:
@@ -745,6 +911,8 @@ button { margin: 2px 8px 2px 0; }
 .node.diversity { background: #edf9ef; }
 .node.worker { background: #f5f5f5; }
 .node.crow { background: #fff0f0; }
+.node.resume { background: #fff2b8; }
+.node.stale { background: #eeeeee; color: #666; }
 .node.running { outline: 3px solid #222; }
 .title { font-weight: bold; margin-bottom: 6px; }
 .meta { color: #555; font-size: 12px; margin-bottom: 8px; }
@@ -863,6 +1031,7 @@ function renderAgentForest(nodes, edges) {
     children.get(edge.from).push(edge.to);
     incoming.add(edge.to);
   }
+  sortTreeChildren(children, byId);
   const roots = nodes.filter(node => !incoming.has(node.id));
   const orderedRoots = roots.length ? roots : nodes;
   const seen = new Set();
@@ -879,8 +1048,24 @@ function buildTreeIndex(nodes, edges) {
     children.get(edge.from).push(edge.to);
     incoming.add(edge.to);
   }
+  sortTreeChildren(children, byId);
   const roots = nodes.filter(node => !incoming.has(node.id));
   return { byId, children, roots: roots.length ? roots : nodes };
+}
+
+function sortTreeChildren(children, byId) {
+  for (const childIds of children.values()) {
+    childIds.sort((left, right) => nodePriority(byId.get(left)) - nodePriority(byId.get(right)));
+  }
+}
+
+function nodePriority(node) {
+  if (!node) return 99;
+  if (node.status === 'running') return 0;
+  if (node.type === 'resume') return 1;
+  if (node.stale) return 8;
+  if (node.status === 'blocked' || node.status === 'dead_end') return 9;
+  return 4;
 }
 
 function renderSvgTree(svg, nodes, edges) {
@@ -965,12 +1150,14 @@ function renderSvgTree(svg, nodes, edges) {
 }
 
 function svgNodeFill(node) {
+  if (node.stale) return '#eeeeee';
   if (node.status === 'solved') return '#c9f6cf';
-  if (node.status === 'blocked' || node.status === 'dead_end') return '#f8caca';
+  if (node.status === 'blocked' || node.status === 'dead_end') return '#eeeeee';
   if (node.type === 'user') return '#fff8d8';
   if (node.type === 'manager') return '#eef3ff';
   if (node.type === 'diversity') return '#edf9ef';
   if (node.type === 'crow') return '#fff0f0';
+  if (node.type === 'resume') return '#fff2b8';
   if (node.status === 'running') return '#fff2b8';
   return '#f5f5f5';
 }
@@ -1025,7 +1212,7 @@ function renderAgentNode(id, byId, children, seen) {
         <span class="tree-key">${esc(node.title || node.id)}</span>
         <span>${esc(node.type)} status=${esc(node.status)}${esc(score)}</span>
       </summary>
-      <div class="node ${esc(node.type || '')} ${node.status === 'running' ? 'running' : ''} ${node.id === selectedNodeId ? 'selected' : ''}" onclick="selectNode('${encodedId}')">
+      <div class="node ${esc(node.type || '')} ${node.status === 'running' ? 'running' : ''} ${node.stale ? 'stale' : ''} ${node.id === selectedNodeId ? 'selected' : ''}" onclick="selectNode('${encodedId}')">
         <div class="title">${esc(node.title || node.id)}</div>
         <div class="meta">${esc(node.type)} status=${esc(node.status)}${esc(score)}</div>
         <div class="body">${esc(node.body || '')}</div>

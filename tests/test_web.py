@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import urlopen
@@ -104,6 +105,54 @@ def test_monitor_snapshot_treats_prompt_only_worker_as_running(tmp_path: Path) -
     assert any(file["path"] == str(prompt_path) for file in worker["files"])
 
 
+def test_monitor_snapshot_shows_resume_node_while_continuing(tmp_path: Path) -> None:
+    store = ContextStore(tmp_path / "runs")
+    run = store.create_run("continue old task")
+    old_candidate = BeamCandidate(
+        id="d0_w0_old",
+        parent_id=None,
+        depth=0,
+        seed=ThoughtSeed(id="seed-old", label="old", instruction="old"),
+        score=0.1,
+        status="blocked",
+        summary="old blocked branch",
+        next_context="old",
+        prompt_path="",
+        response_path="",
+    )
+    store.write_candidate(run, old_candidate)
+    store.write_json(Path(run.root_dir) / "result.json", {"previous": "result"})
+    store.append_event(
+        run,
+        "run.resumed",
+        {"start_depth": 1, "resume_message": "", "frontier": []},
+    )
+    store.write_prompt(run, "workers", "d1_w0_pending", "prompt")
+
+    snapshot = build_monitor_snapshot(store.runs_dir)
+    resume = next(node for node in snapshot["nodes"] if node["type"] == "resume")
+    old_worker = next(node for node in snapshot["nodes"] if node["id"] == "worker:d0_w0_old")
+
+    assert snapshot["run"]["status"] == "running"
+    assert resume["status"] == "running"
+    assert resume["body"] == "continued without a new user message"
+    assert old_worker["stale"]
+
+
+def test_monitor_latest_uses_run_activity_not_directory_mtime(tmp_path: Path) -> None:
+    store = ContextStore(tmp_path / "runs")
+    older_active = store.create_run("older but active")
+    time.sleep(0.01)
+    newer_idle = store.create_run("newer but idle")
+    time.sleep(0.01)
+    store.append_event(older_active, "run.resumed", {"start_depth": 1, "resume_message": ""})
+
+    snapshot = build_monitor_snapshot(store.runs_dir)
+
+    assert snapshot["run"]["run_id"] == older_active.run_id
+    assert snapshot["run"]["run_id"] != newer_idle.run_id
+
+
 def test_monitor_snapshot_keeps_agent_edges_tree_shaped(tmp_path: Path) -> None:
     store = ContextStore(tmp_path / "runs")
     run = store.create_run("branch")
@@ -189,6 +238,10 @@ def test_monitor_page_renders_state_as_trees() -> None:
     assert "foreignObject" in page
     assert "svgNodeLabel" in page
     assert "svg-label-title" in page
+    assert "sortTreeChildren" in page
+    assert "nodePriority" in page
+    assert "node.stale" in page
+    assert "#f8caca" not in page
     assert "renderAgentForest" in page
     assert "objectTree" in page
     assert "renderFileTree" in page
