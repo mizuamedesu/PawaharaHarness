@@ -5,8 +5,10 @@ from pathlib import Path
 
 from pawahara_harness.agents import AgentLaunchSpec, AgentResult
 from pawahara_harness.context import (
+    BeamCandidate,
     ContextStore,
     HelmDirective,
+    ThoughtSeed,
     parse_candidate_report,
     parse_crow_verdict,
     parse_diversity_plan,
@@ -342,6 +344,60 @@ def test_beam_search_orchestrator_resumes_from_saved_frontier(tmp_path: Path) ->
     assert len(second_runtime.calls) == 2
     assert len(resumed.candidates) == 4
     assert max(candidate.depth for candidate in resumed.candidates) == 1
+
+
+def test_resume_frontier_ignores_deep_blocked_candidates(tmp_path: Path) -> None:
+    store = ContextStore(tmp_path / "runs")
+    run = store.create_run("resume the best useful branch")
+    good = BeamCandidate(
+        id="d0_good",
+        parent_id=None,
+        depth=0,
+        seed=ThoughtSeed(id="seed-good", label="good", instruction="good branch"),
+        score=0.7,
+        status="promising",
+        summary="good branch",
+        next_context="keep this",
+        prompt_path="",
+        response_path="",
+    )
+    blocked = BeamCandidate(
+        id="d1_blocked",
+        parent_id="d0_good",
+        depth=1,
+        seed=ThoughtSeed(id="seed-blocked", label="blocked", instruction="blocked branch"),
+        score=0.99,
+        status="blocked",
+        summary="blocked branch",
+        next_context="drop this",
+        prompt_path="",
+        response_path="",
+    )
+    store.write_candidate(run, good)
+    store.write_candidate(run, blocked)
+    runtime = ScoringRuntime()
+    orchestrator = BeamSearchOrchestrator(
+        runtime=runtime,
+        store=store,
+        config=SearchConfig(
+            beam_width=1,
+            branch_factor=1,
+            max_depth=1,
+            max_workers=1,
+            stop_on_solved=False,
+            agentic_roles=False,
+            crow_enabled=False,
+        ),
+    )
+
+    orchestrator.run(goal=run.goal, command="agent", cwd=str(tmp_path), resume_run=run)
+
+    events = store.list_events(run, limit=50)
+    resumed = next(event for event in events if event["kind"] == "run.resumed")
+    assert resumed["payload"]["frontier"] == ["d0_good"]
+    assert resumed["payload"]["start_depth"] == 1
+    assert "Parent candidate: d0_good" in runtime.calls[0].prompt
+    assert "d1_blocked" not in runtime.calls[0].prompt
 
 
 def test_resume_message_is_recorded_and_passed_to_workers(tmp_path: Path) -> None:

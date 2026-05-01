@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -38,6 +39,8 @@ from .context import (
     thought_seed_to_dict,
     truncate,
 )
+
+FRONTIER_STATUSES = {"solved", "promising"}
 
 
 @dataclass(frozen=True)
@@ -174,8 +177,9 @@ class BeamSearchOrchestrator:
             run = resume_run
             previous_candidates = list(self.store.list_candidates(run))
             all_candidates = previous_candidates[:]
-            frontier = self._frontier_from_candidates(previous_candidates)
-            start_depth = (max((candidate.depth for candidate in previous_candidates), default=-1) + 1)
+            frontier, frontier_source = self._resume_frontier_from_candidates(run, previous_candidates)
+            previous_depth = max((candidate.depth for candidate in previous_candidates), default=-1)
+            start_depth = max((candidate.depth for candidate in frontier), default=previous_depth) + 1
             effective_goal = self._resume_goal(run.goal, resume_message)
             self.store.append_event(
                 run,
@@ -186,6 +190,7 @@ class BeamSearchOrchestrator:
                     "metadata": metadata or {},
                     "start_depth": start_depth,
                     "frontier": [candidate.id for candidate in frontier],
+                    "frontier_source": frontier_source,
                 },
             )
             if resume_message:
@@ -344,9 +349,7 @@ class BeamSearchOrchestrator:
             scheduled=scheduled,
             seed_files=seed_files,
         )
-        next_frontier = tuple(
-            sorted(round_candidates, key=lambda candidate: candidate.score, reverse=True)[: self.config.beam_width]
-        )
+        next_frontier = self._rank_frontier_candidates(round_candidates)
         kept_ids = {candidate.id for candidate in next_frontier}
         self.store.append_event(
             run,
@@ -359,14 +362,92 @@ class BeamSearchOrchestrator:
         )
         return round_candidates, next_frontier
 
+    def _resume_frontier_from_candidates(
+        self,
+        run: RunRecord,
+        candidates: list[BeamCandidate],
+    ) -> tuple[tuple[BeamCandidate, ...], str]:
+        by_id = {candidate.id: candidate for candidate in candidates}
+        result_frontier = self._frontier_from_result(run, by_id)
+        if result_frontier:
+            return result_frontier, "result"
+
+        events = self.store.list_events(run, limit=10000)
+        for event in reversed(events):
+            kind = str(event.get("kind", ""))
+            payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+            ids: list[str] = []
+            if kind == "frontier.pruned":
+                ids = [str(item) for item in payload.get("kept", []) if item]
+            elif kind == "run.resumed":
+                ids = [str(item) for item in payload.get("frontier", []) if item]
+            else:
+                continue
+            frontier = tuple(
+                candidate
+                for candidate_id in ids
+                if (candidate := by_id.get(candidate_id)) is not None and self._is_frontier_candidate(candidate)
+            )
+            if frontier:
+                return frontier[: self.config.beam_width], kind
+
+        frontier = self._frontier_from_candidates(candidates)
+        return frontier, "best-viable-candidates" if frontier else "none"
+
+    def _frontier_from_result(
+        self,
+        run: RunRecord,
+        by_id: dict[str, BeamCandidate],
+    ) -> tuple[BeamCandidate, ...]:
+        result_path = Path(run.root_dir) / "result.json"
+        if not result_path.exists():
+            return ()
+        events_path = Path(run.root_dir) / "events.jsonl"
+        try:
+            if events_path.exists() and events_path.stat().st_mtime > result_path.stat().st_mtime:
+                return ()
+        except OSError:
+            return ()
+        try:
+            data = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return ()
+        if not isinstance(data, dict):
+            return ()
+        frontier_ids = []
+        for item in data.get("frontier", []) or []:
+            if isinstance(item, dict) and item.get("id"):
+                frontier_ids.append(str(item["id"]))
+        frontier = tuple(
+            candidate
+            for candidate_id in frontier_ids
+            if (candidate := by_id.get(candidate_id)) is not None and self._is_frontier_candidate(candidate)
+        )
+        if frontier:
+            return frontier[: self.config.beam_width]
+        best = data.get("best_candidate")
+        if isinstance(best, dict) and best.get("id"):
+            candidate = by_id.get(str(best["id"]))
+            if candidate is not None and self._is_frontier_candidate(candidate):
+                return (candidate,)
+        return ()
+
     def _frontier_from_candidates(self, candidates: list[BeamCandidate]) -> tuple[BeamCandidate, ...]:
         if not candidates:
             return ()
-        deepest = max(candidate.depth for candidate in candidates)
-        deepest_candidates = [candidate for candidate in candidates if candidate.depth == deepest]
+        return self._rank_frontier_candidates(candidates)
+
+    def _rank_frontier_candidates(self, candidates: list[BeamCandidate]) -> tuple[BeamCandidate, ...]:
         return tuple(
-            sorted(deepest_candidates, key=lambda candidate: candidate.score, reverse=True)[: self.config.beam_width]
+            sorted(
+                (candidate for candidate in candidates if self._is_frontier_candidate(candidate)),
+                key=lambda candidate: (candidate.score, candidate.depth),
+                reverse=True,
+            )[: self.config.beam_width]
         )
+
+    def _is_frontier_candidate(self, candidate: BeamCandidate) -> bool:
+        return candidate.status in FRONTIER_STATUSES
 
     def _run_round(
         self,
