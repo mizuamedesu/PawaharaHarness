@@ -89,6 +89,78 @@ def test_monitor_file_api_is_restricted_to_runs_dir(tmp_path: Path) -> None:
     assert not blocked["ok"]
 
 
+def test_monitor_snapshot_treats_prompt_only_worker_as_running(tmp_path: Path) -> None:
+    store = ContextStore(tmp_path / "runs")
+    run = store.create_run("continue the work")
+    store.write_json(Path(run.root_dir) / "result.json", {"previous": "finished"})
+    prompt_path = store.write_prompt(run, "workers", "d1_w0_running", "still working")
+
+    snapshot = build_monitor_snapshot(store.runs_dir)
+    worker = next(node for node in snapshot["nodes"] if node["id"] == "worker:d1_w0_running")
+
+    assert snapshot["run"]["status"] == "running"
+    assert snapshot["counts"]["running"] == 1
+    assert worker["status"] == "running"
+    assert any(file["path"] == str(prompt_path) for file in worker["files"])
+
+
+def test_monitor_snapshot_keeps_agent_edges_tree_shaped(tmp_path: Path) -> None:
+    store = ContextStore(tmp_path / "runs")
+    run = store.create_run("branch")
+    parent = BeamCandidate(
+        id="d0_parent",
+        parent_id=None,
+        depth=0,
+        seed=ThoughtSeed(id="seed-0", label="parent", instruction="parent"),
+        score=0.8,
+        status="promising",
+        summary="parent",
+        next_context="parent context",
+        prompt_path="",
+        response_path="",
+    )
+    child = BeamCandidate(
+        id="d1_child",
+        parent_id="d0_parent",
+        depth=1,
+        seed=ThoughtSeed(id="seed-1", label="child", instruction="child"),
+        score=0.7,
+        status="promising",
+        summary="child",
+        next_context="child context",
+        prompt_path="",
+        response_path="",
+    )
+    store.write_candidate(run, parent)
+    store.append_event(
+        run,
+        "manager.started",
+        {"name": "manager_d1_d0_parent", "depth": 1, "parent": "d0_parent"},
+    )
+    store.append_event(
+        run,
+        "diversity.started",
+        {"name": "diversity_d1_d0_parent", "depth": 1, "parent": "d0_parent"},
+    )
+    store.append_event(
+        run,
+        "worker.started",
+        {
+            "candidate": "d1_child",
+            "depth": 1,
+            "index": 0,
+            "parent": "d0_parent",
+            "seed": {"label": "child", "instruction": "child"},
+        },
+    )
+    store.write_candidate(run, child)
+
+    snapshot = build_monitor_snapshot(store.runs_dir)
+
+    assert {"from": "worker:d0_parent", "to": "worker:d1_child"} not in snapshot["edges"]
+    assert {"from": "diversity:diversity_d1_d0_parent", "to": "worker:d1_child"} in snapshot["edges"]
+
+
 def test_monitor_server_serves_snapshot_and_files(tmp_path: Path) -> None:
     store = ContextStore(tmp_path / "runs")
     run = store.create_run("serve monitor")
@@ -110,9 +182,13 @@ def test_monitor_page_renders_state_as_trees() -> None:
     page = render_monitor_page()
 
     assert "agentTree" in page
+    assert "treeViewport" in page
     assert "treeSvg" in page
     assert "eventTree" in page
     assert "renderSvgTree" in page
+    assert "foreignObject" in page
+    assert "svgNodeLabel" in page
+    assert "svg-label-title" in page
     assert "renderAgentForest" in page
     assert "objectTree" in page
     assert "renderFileTree" in page

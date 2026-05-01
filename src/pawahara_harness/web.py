@@ -137,6 +137,11 @@ def build_monitor_snapshot(runs_dir: Path, *, run_id: str | None = None) -> dict
     nodes, edges = build_nodes_and_edges(run_dir, run_data, events, candidates, result_exists=result_exists)
     running = sum(1 for node in nodes if node.get("status") == "running")
     completed = sum(1 for node in nodes if node.get("type") == "worker" and node.get("status") != "running")
+    run_status = "running" if running else "finished" if result_exists else "running"
+    for node in nodes:
+        if node.get("id") == "user":
+            node["status"] = run_status
+            break
     return {
         "ok": True,
         "run": {
@@ -145,7 +150,7 @@ def build_monitor_snapshot(runs_dir: Path, *, run_id: str | None = None) -> dict
             "created_at": run_data.get("created_at", ""),
             "root_dir": str(run_dir),
             "metadata": run_data.get("metadata", {}),
-            "status": "finished" if result_exists else "running",
+            "status": run_status,
         },
         "nodes": nodes,
         "edges": edges,
@@ -480,12 +485,67 @@ def build_nodes_and_edges(
             files=dedupe_files(file_items),
         )
         parent = candidate.get("parent_id")
+        if has_renderable_incoming_edge(edges, nodes, key):
+            continue
         if parent:
             add_edge(worker_node_id(parent), key)
         else:
-            add_edge(diversity_node_id(candidate), key)
+            diversity_id = diversity_node_id(candidate)
+            add_edge(diversity_id if diversity_id in nodes else "user", key)
+
+    add_prompt_only_worker_nodes(run_dir, nodes, node_order, edges, edge_keys, file_cache)
 
     return [nodes[node_id] for node_id in node_order], edges
+
+
+def has_renderable_incoming_edge(
+    edges: list[dict[str, str]],
+    nodes: dict[str, dict[str, Any]],
+    target: str,
+) -> bool:
+    return any(edge.get("to") == target and edge.get("from") in nodes for edge in edges)
+
+
+def add_prompt_only_worker_nodes(
+    run_dir: Path,
+    nodes: dict[str, dict[str, Any]],
+    node_order: list[str],
+    edges: list[dict[str, str]],
+    edge_keys: set[tuple[str, str]],
+    file_cache: dict[tuple[str, str | None], dict[str, Any] | None],
+) -> None:
+    worker_dir = run_dir / "workers"
+    if not worker_dir.exists():
+        return
+
+    def add_edge(source: str, target: str) -> None:
+        key = (source, target)
+        if key in edge_keys:
+            return
+        edge_keys.add(key)
+        edges.append({"from": source, "to": target})
+
+    for prompt_path in sorted(worker_dir.glob("*.prompt.md")):
+        candidate_id = prompt_path.name.removesuffix(".prompt.md")
+        node_id = worker_node_id(candidate_id)
+        if node_id in nodes:
+            continue
+        response_path = prompt_path.with_name(f"{candidate_id}.response.txt")
+        status = "done" if response_path.exists() else "running"
+        file_items = existing_files(prompt_path, response_path, cache=file_cache)
+        nodes[node_id] = {
+            "id": node_id,
+            "type": "worker",
+            "title": worker_title(candidate_id, "worker"),
+            "status": status,
+            "body": read_text_preview(prompt_path),
+            "meta": {"candidate": candidate_id, "source": "worker prompt file"},
+            "details": {"prompt_path": str(prompt_path)},
+            "files": file_items,
+        }
+        node_order.append(node_id)
+        if not has_renderable_incoming_edge(edges, nodes, node_id):
+            add_edge("user", node_id)
 
 
 def existing_files(
@@ -660,20 +720,24 @@ def render_monitor_page() -> str:
 body { font-family: sans-serif; margin: 16px; }
 button { margin: 2px 8px 2px 0; }
 #summary { margin: 12px 0; }
-#layout { display: grid; grid-template-columns: 1fr 420px; gap: 16px; align-items: start; }
+#layout { display: grid; grid-template-columns: minmax(0, 1fr) 420px; gap: 16px; align-items: start; }
 .tree { border-left: 1px solid #aaa; margin-left: 4px; padding-left: 14px; }
 .tree-children { border-left: 1px solid #ccc; margin: 8px 0 0 14px; padding-left: 14px; }
 .tree-leaf { margin: 4px 0; }
 .tree-key { color: #555; font-weight: bold; }
 .tree-branch { margin: 6px 0; }
 .tree-branch > summary { cursor: pointer; }
-.tree-svg { width: 100%; min-height: 360px; border: 1px solid #bbb; background: #fafafa; overflow: auto; }
+.tree-viewport { width: 100%; max-height: 72vh; overflow: auto; border: 1px solid #bbb; background: #fafafa; }
+.tree-svg { display: block; max-width: none; background: transparent; }
 .svg-edge { fill: none; stroke: #222; stroke-width: 2; }
 .svg-node rect { stroke: #222; stroke-width: 2; rx: 8; }
 .svg-node text { font-family: sans-serif; font-size: 12px; pointer-events: none; }
 .svg-node.selected rect { stroke-width: 4; }
 .svg-title { font-weight: bold; font-size: 13px; }
 .svg-meta { fill: #555; }
+.svg-label { box-sizing: border-box; width: 100%; height: 100%; overflow: hidden; padding: 0 2px; font-family: sans-serif; color: #111; pointer-events: none; }
+.svg-label-title { font-weight: bold; font-size: 13px; line-height: 16px; max-height: 32px; overflow: hidden; overflow-wrap: anywhere; word-break: break-all; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.svg-label-line { margin-top: 7px; color: #555; font-size: 12px; line-height: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .node { border: 1px solid #222; margin: 6px 0; padding: 10px; background: #fff; cursor: pointer; }
 .node.selected { outline: 3px solid #444; }
 .node.user { background: #fff8d8; }
@@ -701,7 +765,7 @@ pre { white-space: pre-wrap; overflow: auto; border: 1px solid #ccc; padding: 8p
 <div id="layout">
   <main>
     <h2>Agents</h2>
-    <svg id="treeSvg" class="tree-svg"></svg>
+    <div id="treeViewport" class="tree-viewport"><svg id="treeSvg" class="tree-svg"></svg></div>
     <div id="agentTree" class="tree"></div>
     <h2>Events</h2>
     <div id="eventTree" class="tree"></div>
@@ -843,16 +907,18 @@ function renderSvgTree(svg, nodes, edges) {
   for (const root of roots) visit(root.id, 0);
   for (const node of nodes) if (!positions.has(node.id)) visit(node.id, 0);
 
-  const nodeWidth = 210;
-  const nodeHeight = 86;
-  const xGap = 270;
-  const yGap = 132;
+  const nodeWidth = 260;
+  const nodeHeight = 118;
+  const xGap = 360;
+  const yGap = 180;
   const margin = 40;
   const width = Math.max(720, margin * 2 + maxDepth * xGap + nodeWidth);
   const height = Math.max(360, margin * 2 + Math.max(1, row) * yGap);
   svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+  svg.setAttribute('width', String(width));
   svg.setAttribute('height', String(height));
-
+  svg.style.width = `${width}px`;
+  svg.style.height = `${height}px`;
   const point = id => {
     const pos = positions.get(id) || { depth: 0, row: 0 };
     return {
@@ -883,6 +949,9 @@ function renderSvgTree(svg, nodes, edges) {
       tabindex: '0',
     });
     group.addEventListener('click', () => selectNode(node.id));
+    const tooltip = svgEl('title', {});
+    tooltip.textContent = `${node.title || node.id}\n${node.type || ''} ${node.status || ''}`;
+    group.appendChild(tooltip);
     group.appendChild(svgEl('rect', {
       x: pos.x,
       y: pos.y,
@@ -890,10 +959,7 @@ function renderSvgTree(svg, nodes, edges) {
       height: nodeHeight,
       fill: svgNodeFill(node),
     }));
-    appendSvgText(group, node.title || node.id, pos.x + 12, pos.y + 24, 'svg-title');
-    appendSvgText(group, `${node.type || ''}  ${node.status || ''}`, pos.x + 12, pos.y + 46, 'svg-meta');
-    const score = node.score === undefined ? '' : `score ${node.score}`;
-    appendSvgText(group, score || shortSvgText(node.body || '', 28), pos.x + 12, pos.y + 68, 'svg-meta');
+    group.appendChild(svgNodeLabel(node, pos.x + 10, pos.y + 8, nodeWidth - 20, nodeHeight - 14));
     svg.appendChild(group);
   }
 }
@@ -917,15 +983,33 @@ function svgEl(name, attrs) {
   return element;
 }
 
-function appendSvgText(group, value, x, y, className) {
-  const text = svgEl('text', { x, y, class: className });
-  text.textContent = shortSvgText(value, 30);
-  group.appendChild(text);
-}
+function svgNodeLabel(node, x, y, width, height) {
+  const foreignObject = svgEl('foreignObject', { x, y, width, height });
+  const container = document.createElementNS('http://www.w3.org/1999/xhtml', 'div');
+  container.setAttribute('class', 'svg-label');
 
-function shortSvgText(value, limit) {
-  value = String(value ?? '').replace(/\\s+/g, ' ').trim();
-  return value.length <= limit ? value : value.slice(0, limit - 1) + '…';
+  const title = document.createElementNS('http://www.w3.org/1999/xhtml', 'div');
+  title.setAttribute('class', 'svg-label-title');
+  title.textContent = String(node.title || node.id || '');
+  container.appendChild(title);
+
+  const meta = document.createElementNS('http://www.w3.org/1999/xhtml', 'div');
+  meta.setAttribute('class', 'svg-label-line');
+  meta.textContent = `${node.type || ''}  ${node.status || ''}`;
+  container.appendChild(meta);
+
+  const body = document.createElementNS('http://www.w3.org/1999/xhtml', 'div');
+  body.setAttribute('class', 'svg-label-line');
+  body.textContent = node.score === undefined ? String(node.body || '') : `score ${node.score}`;
+  container.appendChild(body);
+
+  const id = document.createElementNS('http://www.w3.org/1999/xhtml', 'div');
+  id.setAttribute('class', 'svg-label-line');
+  id.textContent = String(node.id || '');
+  container.appendChild(id);
+
+  foreignObject.appendChild(container);
+  return foreignObject;
 }
 
 function renderAgentNode(id, byId, children, seen) {

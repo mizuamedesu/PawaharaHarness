@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
+import os
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock
 from typing import Any
 from uuid import uuid4
 
@@ -12,6 +15,7 @@ from uuid import uuid4
 DEFAULT_RUNS_DIR = Path(".pawahara/runs")
 VALID_STATUSES = {"solved", "promising", "dead_end", "blocked"}
 HELM_ROLES = ("main", "subagent", "manager", "diversity", "worker", "crow")
+COMPACT_JSON_SEPARATORS = (",", ":")
 
 
 @dataclass(frozen=True)
@@ -105,15 +109,62 @@ class RoleState:
     compact_context: str = ""
 
 
+class _EventBuffer:
+    def __init__(self, path: Path, *, max_lines: int):
+        self.path = path
+        self.max_lines = max(1, max_lines)
+        self.lines: list[str] = []
+        self.lock = Lock()
+        self.depth = 0
+        self._parent_ready = False
+        self._handle: Any | None = None
+
+    def append(self, line: str) -> None:
+        with self.lock:
+            self.lines.append(line)
+            if len(self.lines) >= self.max_lines:
+                self._flush_locked()
+
+    def flush(self) -> None:
+        with self.lock:
+            self._flush_locked()
+
+    def close(self) -> None:
+        with self.lock:
+            self._flush_locked()
+            if self._handle is not None:
+                self._handle.close()
+                self._handle = None
+
+    def _flush_locked(self) -> None:
+        if not self.lines:
+            return
+        if not self._parent_ready:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._parent_ready = True
+        if self._handle is None:
+            self._handle = open(self.path, "a", encoding="utf-8")
+        self._handle.writelines(self.lines)
+        self._handle.flush()
+        self.lines.clear()
+
+
 class ContextStore:
     def __init__(self, runs_dir: Path = DEFAULT_RUNS_DIR):
         self.runs_dir = runs_dir
+        self._role_dirs: dict[tuple[str, str], Path] = {}
+        self._created_dirs: set[str] = set()
+        self._created_dirs_lock = Lock()
+        self._event_buffers: dict[str, _EventBuffer] = {}
+        self._event_buffers_lock = Lock()
 
     def create_run(self, goal: str, metadata: dict[str, Any] | None = None) -> RunRecord:
         created_at = now_iso()
         run_id = f"run_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:8]}"
         root_dir = self.runs_dir / run_id
         root_dir.mkdir(parents=True, exist_ok=False)
+        with self._created_dirs_lock:
+            self._created_dirs.add(str(root_dir))
         record = RunRecord(
             run_id=run_id,
             goal=goal,
@@ -121,7 +172,7 @@ class ContextStore:
             root_dir=str(root_dir),
             metadata=metadata or {},
         )
-        self.write_json(root_dir / "run.json", asdict(record))
+        self.write_json(root_dir / "run.json", run_record_to_dict(record))
         self.append_event(record, "run.created", {"goal": goal, "metadata": metadata or {}})
         return record
 
@@ -164,20 +215,28 @@ class ContextStore:
         return tuple(candidates)
 
     def role_dir(self, run: RunRecord, role: str) -> Path:
+        key = (run.root_dir, role)
+        cached = self._role_dirs.get(key)
+        if cached is not None:
+            return cached
         path = Path(run.root_dir) / role
-        path.mkdir(parents=True, exist_ok=True)
+        self._ensure_dir(path)
+        self._role_dirs[key] = path
         return path
 
     def write_prompt(self, run: RunRecord, role: str, name: str, content: str) -> Path:
-        return self.write_text(self.role_dir(run, role) / f"{safe_name(name)}.prompt.md", content)
+        return self._write_text_ready_parent(self.role_dir(run, role) / f"{safe_name(name)}.prompt.md", content)
 
     def write_response(self, run: RunRecord, role: str, name: str, content: str) -> Path:
-        return self.write_text(self.role_dir(run, role) / f"{safe_name(name)}.response.txt", content)
+        return self._write_text_ready_parent(self.role_dir(run, role) / f"{safe_name(name)}.response.txt", content)
 
     def write_candidate(self, run: RunRecord, candidate: BeamCandidate) -> Path:
         path = self.role_dir(run, "candidates") / f"{safe_name(candidate.id)}.json"
-        self.write_json(path, asdict(candidate))
-        self.append_event(run, "candidate.completed", asdict(candidate))
+        payload = beam_candidate_to_dict(candidate)
+        payload_json = json.dumps(payload, ensure_ascii=False, separators=COMPACT_JSON_SEPARATORS)
+        self._write_json_text_ready_parent(path, payload_json + "\n")
+        event_payload_json = self._candidate_completed_payload_json(candidate.id, payload_json)
+        self._append_event_json(run, "candidate.completed", event_payload_json)
         return path
 
     def read_role_state(self, run: RunRecord, role: str) -> RoleState:
@@ -194,16 +253,62 @@ class ContextStore:
 
     def write_role_state(self, run: RunRecord, state: RoleState) -> Path:
         path = self.role_dir(run, "roles") / f"{safe_name(state.role)}.json"
-        return self.write_json(path, asdict(state))
+        return self._write_json_ready_parent(path, role_state_to_dict(state))
+
+    @contextmanager
+    def buffered_events(self, run: RunRecord, *, max_lines: int = 64):
+        buffer_key = run.root_dir
+        with self._event_buffers_lock:
+            buffer = self._event_buffers.get(buffer_key)
+            if buffer is None:
+                buffer = _EventBuffer(Path(run.root_dir) / "events.jsonl", max_lines=max_lines)
+                self._event_buffers[buffer_key] = buffer
+            buffer.depth += 1
+        try:
+            yield
+        finally:
+            with self._event_buffers_lock:
+                buffer.depth -= 1
+                should_close = buffer.depth == 0
+                if should_close:
+                    self._event_buffers.pop(buffer_key, None)
+            if should_close:
+                buffer.close()
 
     def append_event(self, run: RunRecord, kind: str, payload: dict[str, Any]) -> None:
         event = {"ts": now_iso(), "kind": kind, "payload": payload}
-        path = Path(run.root_dir) / "events.jsonl"
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+        line = json.dumps(event, ensure_ascii=False, separators=COMPACT_JSON_SEPARATORS) + "\n"
+        self._append_event_line(run, line)
+
+    def _append_event_json(self, run: RunRecord, kind: str, payload_json: str) -> None:
+        line = (
+            '{"ts":'
+            + json.dumps(now_iso(), ensure_ascii=False, separators=COMPACT_JSON_SEPARATORS)
+            + ',"kind":'
+            + json.dumps(kind, ensure_ascii=False, separators=COMPACT_JSON_SEPARATORS)
+            + ',"payload":'
+            + payload_json
+            + "}\n"
+        )
+        self._append_event_line(run, line)
+
+    def _append_event_line(self, run: RunRecord, line: str) -> None:
+        with self._event_buffers_lock:
+            buffer = self._event_buffers.get(run.root_dir)
+        if buffer is not None:
+            buffer.append(line)
+            return
+        path = Path(self._event_path_key(run))
+        self._ensure_dir(path.parent)
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(line)
 
     def list_events(self, run: RunRecord, limit: int = 20) -> tuple[dict[str, Any], ...]:
-        path = Path(run.root_dir) / "events.jsonl"
+        with self._event_buffers_lock:
+            buffer = self._event_buffers.get(run.root_dir)
+        if buffer is not None:
+            buffer.flush()
+        path = Path(self._event_path_key(run))
         if not path.exists():
             return ()
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -218,14 +323,56 @@ class ContextStore:
         return tuple(events)
 
     def write_json(self, path: Path, payload: Any) -> Path:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self._ensure_dir(path.parent)
+        return self._write_json_ready_parent(path, payload)
+
+    def _write_json_ready_parent(self, path: Path, payload: Any) -> Path:
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, indent=2))
+            handle.write("\n")
+        return path
+
+    def _write_compact_json_ready_parent(self, path: Path, payload: Any) -> Path:
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, separators=COMPACT_JSON_SEPARATORS))
+            handle.write("\n")
         return path
 
     def write_text(self, path: Path, content: str) -> Path:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
+        self._ensure_dir(path.parent)
+        return self._write_text_ready_parent(path, content)
+
+    def _write_text_ready_parent(self, path: Path, content: str) -> Path:
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(content)
         return path
+
+    def _ensure_dir(self, path: Path) -> None:
+        key = str(path)
+        with self._created_dirs_lock:
+            if key in self._created_dirs:
+                return
+            path.mkdir(parents=True, exist_ok=True)
+            self._created_dirs.add(key)
+
+    def _event_path_key(self, run: RunRecord) -> str:
+        return os.path.join(run.root_dir, "events.jsonl")
+
+    def _candidate_completed_payload_json(self, candidate_id: str, payload_json: str) -> str:
+        if not payload_json.startswith("{"):
+            raise ValueError("candidate payload JSON must be an object")
+        if payload_json == "{}":
+            return (
+                '{"candidate":'
+                + json.dumps(candidate_id, ensure_ascii=False, separators=COMPACT_JSON_SEPARATORS)
+                + "}"
+            )
+        return (
+            '{"candidate":'
+            + json.dumps(candidate_id, ensure_ascii=False, separators=COMPACT_JSON_SEPARATORS)
+            + ","
+            + payload_json[1:]
+        )
 
 
 def build_manager_context(goal: str, parent: BeamCandidate | None, policy: ContextPolicy) -> str:
@@ -606,6 +753,84 @@ def beam_candidate_from_dict(data: dict[str, Any]) -> BeamCandidate:
         response_path=str(data["response_path"]),
         artifacts=tuple(str(item) for item in data.get("artifacts", [])),
     )
+
+
+def run_record_to_dict(run: RunRecord) -> dict[str, Any]:
+    return {
+        "run_id": run.run_id,
+        "goal": run.goal,
+        "created_at": run.created_at,
+        "root_dir": run.root_dir,
+        "metadata": run.metadata,
+    }
+
+
+def thought_seed_to_dict(seed: ThoughtSeed) -> dict[str, Any]:
+    return {
+        "id": seed.id,
+        "label": seed.label,
+        "instruction": seed.instruction,
+        "novelty_targets": seed.novelty_targets,
+    }
+
+
+def beam_candidate_to_dict(candidate: BeamCandidate) -> dict[str, Any]:
+    return {
+        "id": candidate.id,
+        "parent_id": candidate.parent_id,
+        "depth": candidate.depth,
+        "seed": thought_seed_to_dict(candidate.seed),
+        "score": candidate.score,
+        "status": candidate.status,
+        "summary": candidate.summary,
+        "next_context": candidate.next_context,
+        "prompt_path": candidate.prompt_path,
+        "response_path": candidate.response_path,
+        "artifacts": candidate.artifacts,
+    }
+
+
+def crow_verdict_to_dict(verdict: CrowVerdict) -> dict[str, Any]:
+    return {
+        "continue_search": verdict.continue_search,
+        "message": verdict.message,
+        "reason": verdict.reason,
+        "force_depths": verdict.force_depths,
+    }
+
+
+def manager_decision_to_dict(decision: ManagerDecision) -> dict[str, Any]:
+    return {
+        "directive": decision.directive,
+        "context_to_keep": decision.context_to_keep,
+        "context_to_drop": decision.context_to_drop,
+        "stop": decision.stop,
+        "rationale": decision.rationale,
+    }
+
+
+def diversity_plan_to_dict(plan: DiversityPlan) -> dict[str, Any]:
+    return {
+        "seeds": [thought_seed_to_dict(seed) for seed in plan.seeds],
+        "rationale": plan.rationale,
+    }
+
+
+def helm_directive_to_dict(directive: HelmDirective) -> dict[str, Any]:
+    return {
+        "name": directive.name,
+        "content": directive.content,
+        "scopes": directive.scopes,
+    }
+
+
+def role_state_to_dict(state: RoleState) -> dict[str, Any]:
+    return {
+        "role": state.role,
+        "session_id": state.session_id,
+        "turns": state.turns,
+        "compact_context": state.compact_context,
+    }
 
 
 def thought_seed_from_dict(data: dict[str, Any]) -> ThoughtSeed:

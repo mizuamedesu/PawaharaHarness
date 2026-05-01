@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -19,16 +19,23 @@ from .context import (
     RunRecord,
     ThoughtSeed,
     applicable_helm_directives,
+    beam_candidate_to_dict,
     build_crow_prompt,
     build_manager_context,
     build_diversity_prompt,
     build_manager_prompt,
     build_worker_prompt,
+    crow_verdict_to_dict,
+    diversity_plan_to_dict,
+    helm_directive_to_dict,
+    manager_decision_to_dict,
     parse_candidate_report,
     parse_crow_verdict,
     parse_diversity_plan,
     parse_manager_decision,
     render_helm_context,
+    run_record_to_dict,
+    thought_seed_to_dict,
     truncate,
 )
 
@@ -61,11 +68,11 @@ class SearchResult:
 
     def as_dict(self) -> dict[str, Any]:
         return {
-            "run": asdict(self.run),
-            "best_candidate": asdict(self.best_candidate) if self.best_candidate else None,
-            "frontier": [asdict(candidate) for candidate in self.frontier],
-            "candidates": [asdict(candidate) for candidate in self.candidates],
-            "crow_nudges": [asdict(nudge) for nudge in self.crow_nudges],
+            "run": run_record_to_dict(self.run),
+            "best_candidate": beam_candidate_to_dict(self.best_candidate) if self.best_candidate else None,
+            "frontier": [beam_candidate_to_dict(candidate) for candidate in self.frontier],
+            "candidates": [beam_candidate_to_dict(candidate) for candidate in self.candidates],
+            "crow_nudges": [crow_verdict_to_dict(nudge) for nudge in self.crow_nudges],
         }
 
 
@@ -198,58 +205,59 @@ class BeamSearchOrchestrator:
             start_depth = 0
             effective_goal = goal
 
-        for depth in range(start_depth, start_depth + self.config.max_depth):
-            round_candidates, frontier = self._run_depth(
-                run=run,
-                goal=effective_goal,
-                command=command,
-                cwd=cwd,
-                depth=depth,
-                frontier=frontier,
-                seed_files=seed_files or {},
-            )
-            if not round_candidates:
-                break
-            all_candidates.extend(round_candidates)
-            if self.config.stop_on_solved and any(candidate.status == "solved" for candidate in frontier):
-                break
-
-        crow_nudges: list[CrowVerdict] = []
-        next_depth = start_depth + self.config.max_depth
-        if self.config.crow_enabled:
-            for nudge_index in range(max(0, self.config.crow_max_nudges)):
-                best = max(all_candidates, key=lambda candidate: candidate.score, default=None)
-                if best and best.status == "solved":
-                    break
-                verdict = self._crow_verdict(
+        with self.store.buffered_events(run):
+            for depth in range(start_depth, start_depth + self.config.max_depth):
+                round_candidates, frontier = self._run_depth(
                     run=run,
                     goal=effective_goal,
-                    candidates=tuple(all_candidates),
-                    frontier=frontier,
-                    nudge_index=nudge_index,
-                    command=self.role_command or command,
+                    command=command,
                     cwd=cwd,
+                    depth=depth,
+                    frontier=frontier,
+                    seed_files=seed_files or {},
                 )
-                crow_nudges.append(verdict)
-                self.store.append_event(run, "crow.verdict", asdict(verdict))
-                if not verdict.continue_search:
+                if not round_candidates:
                     break
-                for _ in range(verdict.force_depths):
-                    round_candidates, frontier = self._run_depth(
+                all_candidates.extend(round_candidates)
+                if self.config.stop_on_solved and any(candidate.status == "solved" for candidate in frontier):
+                    break
+
+            crow_nudges: list[CrowVerdict] = []
+            next_depth = start_depth + self.config.max_depth
+            if self.config.crow_enabled:
+                for nudge_index in range(max(0, self.config.crow_max_nudges)):
+                    best = max(all_candidates, key=lambda candidate: candidate.score, default=None)
+                    if best and best.status == "solved":
+                        break
+                    verdict = self._crow_verdict(
                         run=run,
                         goal=effective_goal,
-                        command=command,
-                        cwd=cwd,
-                        depth=next_depth,
+                        candidates=tuple(all_candidates),
                         frontier=frontier,
-                        seed_files=seed_files or {},
+                        nudge_index=nudge_index,
+                        command=self.role_command or command,
+                        cwd=cwd,
                     )
-                    next_depth += 1
-                    if not round_candidates:
+                    crow_nudges.append(verdict)
+                    self.store.append_event(run, "crow.verdict", crow_verdict_to_dict(verdict))
+                    if not verdict.continue_search:
                         break
-                    all_candidates.extend(round_candidates)
-                    if self.config.stop_on_solved and any(candidate.status == "solved" for candidate in frontier):
-                        break
+                    for _ in range(verdict.force_depths):
+                        round_candidates, frontier = self._run_depth(
+                            run=run,
+                            goal=effective_goal,
+                            command=command,
+                            cwd=cwd,
+                            depth=next_depth,
+                            frontier=frontier,
+                            seed_files=seed_files or {},
+                        )
+                        next_depth += 1
+                        if not round_candidates:
+                            break
+                        all_candidates.extend(round_candidates)
+                        if self.config.stop_on_solved and any(candidate.status == "solved" for candidate in frontier):
+                            break
 
         best = max(all_candidates, key=lambda candidate: candidate.score, default=None)
         result = SearchResult(
@@ -339,13 +347,14 @@ class BeamSearchOrchestrator:
         next_frontier = tuple(
             sorted(round_candidates, key=lambda candidate: candidate.score, reverse=True)[: self.config.beam_width]
         )
+        kept_ids = {candidate.id for candidate in next_frontier}
         self.store.append_event(
             run,
             "frontier.pruned",
             {
                 "depth": depth,
                 "kept": [candidate.id for candidate in next_frontier],
-                "dropped": [candidate.id for candidate in round_candidates if candidate not in next_frontier],
+                "dropped": [candidate.id for candidate in round_candidates if candidate.id not in kept_ids],
             },
         )
         return round_candidates, next_frontier
@@ -443,7 +452,7 @@ class BeamSearchOrchestrator:
                 "depth": depth,
                 "index": index,
                 "parent": parent.id if parent else None,
-                "seed": asdict(seed),
+                "seed": thought_seed_to_dict(seed),
                 "prompt_path": str(prompt_path),
             },
         )
@@ -560,7 +569,7 @@ class BeamSearchOrchestrator:
                 "parent": parent.id if parent else None,
                 "prompt_path": str(prompt_path),
                 "response_path": str(response_path),
-                "decision": asdict(decision),
+                "decision": manager_decision_to_dict(decision),
                 "invocation": {
                     "exit_code": result.exit_code,
                     "sandbox_id": result.sandbox_id,
@@ -643,7 +652,7 @@ class BeamSearchOrchestrator:
                 "parent": parent.id if parent else None,
                 "prompt_path": str(prompt_path),
                 "response_path": str(response_path),
-                "plan": asdict(plan),
+                "plan": diversity_plan_to_dict(plan),
                 "invocation": {
                     "exit_code": result.exit_code,
                     "sandbox_id": result.sandbox_id,
@@ -709,7 +718,7 @@ class BeamSearchOrchestrator:
                 "nudge_index": nudge_index,
                 "prompt_path": str(prompt_path),
                 "response_path": str(response_path),
-                "verdict": asdict(verdict),
+                "verdict": crow_verdict_to_dict(verdict),
                 "invocation": {
                     "exit_code": result.exit_code,
                     "sandbox_id": result.sandbox_id,
@@ -731,7 +740,7 @@ class BeamSearchOrchestrator:
             {
                 "role": role,
                 "name": name,
-                "directives": [asdict(directive) for directive in directives],
+                "directives": [helm_directive_to_dict(directive) for directive in directives],
             },
         )
         return f"{helm_context}\n\n---\n\n{prompt}"

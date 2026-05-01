@@ -5,6 +5,7 @@ from pathlib import Path
 
 from pawahara_harness.agents import AgentLaunchSpec, AgentResult
 from pawahara_harness.context import (
+    ContextStore,
     HelmDirective,
     parse_candidate_report,
     parse_crow_verdict,
@@ -126,6 +127,11 @@ class CrowRuntime:
         )
 
 
+class RaisingRuntime:
+    def run_agent(self, spec: AgentLaunchSpec) -> AgentResult:
+        raise RuntimeError(f"boom from {spec.name}")
+
+
 def test_parse_candidate_report_reads_fenced_json() -> None:
     report = parse_candidate_report(
         '```json\n{"status":"solved","summary":"done","score":0.95,"next_context":"answer"}\n```',
@@ -195,6 +201,95 @@ def test_beam_search_orchestrator_prunes_and_persists(tmp_path: Path) -> None:
     assert result.best_candidate.score > 0.0
     assert Path(result.best_candidate.prompt_path).exists()
     assert Path(result.run.root_dir, "result.json").exists()
+
+
+def test_search_persists_artifacts_and_per_candidate_event_order(tmp_path: Path) -> None:
+    runtime = ScoringRuntime()
+    orchestrator = BeamSearchOrchestrator(
+        runtime=runtime,
+        config=SearchConfig(
+            beam_width=4,
+            branch_factor=8,
+            max_depth=1,
+            max_workers=4,
+            stop_on_solved=False,
+            agentic_roles=False,
+            crow_enabled=False,
+        ),
+    )
+    orchestrator.store.runs_dir = tmp_path / "runs"
+
+    result = orchestrator.run(goal="solve puzzle", command="agent", cwd=str(tmp_path))
+    run_root = Path(result.run.root_dir)
+
+    assert (run_root / "run.json").exists()
+    assert (run_root / "events.jsonl").exists()
+    assert (run_root / "result.json").exists()
+    assert len(result.candidates) == 8
+    for candidate in result.candidates:
+        assert Path(candidate.prompt_path).exists()
+        assert Path(candidate.response_path).exists()
+        candidate_json = run_root / "candidates" / f"{candidate.id}.json"
+        assert candidate_json.exists()
+        assert json.loads(candidate_json.read_text(encoding="utf-8"))["id"] == candidate.id
+
+    events = [
+        json.loads(line)
+        for line in (run_root / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    kinds = [event["kind"] for event in events]
+    assert kinds[0] == "run.created"
+    assert kinds[-1] == "frontier.pruned"
+
+    positions: dict[tuple[str, str], int] = {}
+    for index, event in enumerate(events):
+        candidate_id = event.get("payload", {}).get("candidate")
+        if candidate_id:
+            positions[(candidate_id, event["kind"])] = index
+
+    for candidate in result.candidates:
+        assert positions[(candidate.id, "worker.started")] < positions[(candidate.id, "candidate.completed")]
+        assert positions[(candidate.id, "candidate.completed")] < positions[(candidate.id, "worker.invocation")]
+
+
+def test_buffered_events_flush_when_worker_runtime_raises(tmp_path: Path) -> None:
+    orchestrator = BeamSearchOrchestrator(
+        runtime=RaisingRuntime(),
+        config=SearchConfig(
+            beam_width=1,
+            branch_factor=1,
+            max_depth=1,
+            max_workers=1,
+            agentic_roles=False,
+            crow_enabled=False,
+        ),
+    )
+    orchestrator.store.runs_dir = tmp_path / "runs"
+
+    try:
+        orchestrator.run(goal="solve puzzle", command="agent", cwd=str(tmp_path))
+    except RuntimeError as exc:
+        assert "boom from" in str(exc)
+    else:
+        raise AssertionError("runtime failure should propagate")
+
+    run_roots = list((tmp_path / "runs").iterdir())
+    assert len(run_roots) == 1
+    events = [
+        json.loads(line)
+        for line in (run_roots[0] / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [event["kind"] for event in events] == ["run.created", "worker.started"]
+
+
+def test_empty_response_artifact_preserves_path(tmp_path: Path) -> None:
+    store = ContextStore(tmp_path / "runs")
+    run = store.create_run("empty responses")
+
+    response = store.write_response(run, "workers", "a", "")
+
+    assert response.exists()
+    assert response.read_text(encoding="utf-8") == ""
 
 
 def test_beam_search_orchestrator_resumes_from_saved_frontier(tmp_path: Path) -> None:
