@@ -11,16 +11,19 @@ from .context import (
     BeamCandidate,
     ContextPolicy,
     ContextStore,
+    CrowVerdict,
     DiversityPlan,
     ManagerDecision,
     RoleState,
     RunRecord,
     ThoughtSeed,
+    build_crow_prompt,
     build_manager_context,
     build_diversity_prompt,
     build_manager_prompt,
     build_worker_prompt,
     parse_candidate_report,
+    parse_crow_verdict,
     parse_diversity_plan,
     parse_manager_decision,
     truncate,
@@ -38,6 +41,9 @@ class SearchConfig:
     reuse_role_sessions: bool = True
     model: str | None = None
     effort: str | None = None
+    crow_enabled: bool = True
+    crow_max_nudges: int = 3
+    crow_event_limit: int = 20
     context_policy: ContextPolicy = field(default_factory=ContextPolicy)
 
 
@@ -47,6 +53,7 @@ class SearchResult:
     best_candidate: BeamCandidate | None
     frontier: tuple[BeamCandidate, ...]
     candidates: tuple[BeamCandidate, ...]
+    crow_nudges: tuple[CrowVerdict, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -54,6 +61,7 @@ class SearchResult:
             "best_candidate": asdict(self.best_candidate) if self.best_candidate else None,
             "frontier": [asdict(candidate) for candidate in self.frontier],
             "candidates": [asdict(candidate) for candidate in self.candidates],
+            "crow_nudges": [asdict(nudge) for nudge in self.crow_nudges],
         }
 
 
@@ -173,67 +181,57 @@ class BeamSearchOrchestrator:
             start_depth = 0
 
         for depth in range(start_depth, start_depth + self.config.max_depth):
-            parents = frontier[: self.config.beam_width] or (None,)
-            scheduled = []
-            for parent in parents:
-                manager_decision = self._manager_decision(
-                    run=run,
-                    goal=goal,
-                    parent=parent,
-                    depth=depth,
-                    frontier=frontier,
-                    command=self.role_command or command,
-                    cwd=cwd,
-                )
-                if manager_decision.stop:
-                    self.store.append_event(
-                        run,
-                        "manager.stop",
-                        {
-                            "depth": depth,
-                            "parent": parent.id if parent else None,
-                            "rationale": manager_decision.rationale,
-                        },
-                    )
-                    continue
-                diversity_plan = self._diversity_plan(
-                    run=run,
-                    goal=goal,
-                    parent=parent,
-                    manager_decision=manager_decision,
-                    depth=depth,
-                    command=self.role_command or command,
-                    cwd=cwd,
-                )
-                for seed in diversity_plan.seeds[: self.config.branch_factor]:
-                    scheduled.append((parent, seed, manager_decision))
-            if not scheduled:
-                break
-
-            round_candidates = self._run_round(
+            round_candidates, frontier = self._run_depth(
                 run=run,
                 goal=goal,
                 command=command,
                 cwd=cwd,
                 depth=depth,
-                scheduled=scheduled,
+                frontier=frontier,
                 seed_files=seed_files or {},
             )
+            if not round_candidates:
+                break
             all_candidates.extend(round_candidates)
-            frontier = tuple(
-                sorted(round_candidates, key=lambda candidate: candidate.score, reverse=True)[: self.config.beam_width]
-            )
-            self.store.append_event(
-                run,
-                "frontier.pruned",
-                {
-                    "depth": depth,
-                    "kept": [candidate.id for candidate in frontier],
-                    "dropped": [candidate.id for candidate in round_candidates if candidate not in frontier],
-                },
-            )
             if self.config.stop_on_solved and any(candidate.status == "solved" for candidate in frontier):
                 break
+
+        crow_nudges: list[CrowVerdict] = []
+        next_depth = start_depth + self.config.max_depth
+        if self.config.crow_enabled:
+            for nudge_index in range(max(0, self.config.crow_max_nudges)):
+                best = max(all_candidates, key=lambda candidate: candidate.score, default=None)
+                if best and best.status == "solved":
+                    break
+                verdict = self._crow_verdict(
+                    run=run,
+                    goal=goal,
+                    candidates=tuple(all_candidates),
+                    frontier=frontier,
+                    nudge_index=nudge_index,
+                    command=self.role_command or command,
+                    cwd=cwd,
+                )
+                crow_nudges.append(verdict)
+                self.store.append_event(run, "crow.verdict", asdict(verdict))
+                if not verdict.continue_search:
+                    break
+                for _ in range(verdict.force_depths):
+                    round_candidates, frontier = self._run_depth(
+                        run=run,
+                        goal=goal,
+                        command=command,
+                        cwd=cwd,
+                        depth=next_depth,
+                        frontier=frontier,
+                        seed_files=seed_files or {},
+                    )
+                    next_depth += 1
+                    if not round_candidates:
+                        break
+                    all_candidates.extend(round_candidates)
+                    if self.config.stop_on_solved and any(candidate.status == "solved" for candidate in frontier):
+                        break
 
         best = max(all_candidates, key=lambda candidate: candidate.score, default=None)
         result = SearchResult(
@@ -241,9 +239,81 @@ class BeamSearchOrchestrator:
             best_candidate=best,
             frontier=frontier,
             candidates=tuple(all_candidates),
+            crow_nudges=tuple(crow_nudges),
         )
         self.store.write_json(Path(run.root_dir) / "result.json", result.as_dict())
         return result
+
+    def _run_depth(
+        self,
+        *,
+        run: RunRecord,
+        goal: str,
+        command: str,
+        cwd: str,
+        depth: int,
+        frontier: tuple[BeamCandidate, ...],
+        seed_files: dict[str, str | bytes],
+    ) -> tuple[list[BeamCandidate], tuple[BeamCandidate, ...]]:
+        parents = frontier[: self.config.beam_width] or (None,)
+        scheduled = []
+        for parent in parents:
+            manager_decision = self._manager_decision(
+                run=run,
+                goal=goal,
+                parent=parent,
+                depth=depth,
+                frontier=frontier,
+                command=self.role_command or command,
+                cwd=cwd,
+            )
+            if manager_decision.stop:
+                self.store.append_event(
+                    run,
+                    "manager.stop",
+                    {
+                        "depth": depth,
+                        "parent": parent.id if parent else None,
+                        "rationale": manager_decision.rationale,
+                    },
+                )
+                continue
+            diversity_plan = self._diversity_plan(
+                run=run,
+                goal=goal,
+                parent=parent,
+                manager_decision=manager_decision,
+                depth=depth,
+                command=self.role_command or command,
+                cwd=cwd,
+            )
+            for seed in diversity_plan.seeds[: self.config.branch_factor]:
+                scheduled.append((parent, seed, manager_decision))
+        if not scheduled:
+            return [], frontier
+
+        round_candidates = self._run_round(
+            run=run,
+            goal=goal,
+            command=command,
+            cwd=cwd,
+            depth=depth,
+            scheduled=scheduled,
+            seed_files=seed_files,
+        )
+        next_frontier = tuple(
+            sorted(round_candidates, key=lambda candidate: candidate.score, reverse=True)[: self.config.beam_width]
+        )
+        self.store.append_event(
+            run,
+            "frontier.pruned",
+            {
+                "depth": depth,
+                "kept": [candidate.id for candidate in next_frontier],
+                "dropped": [candidate.id for candidate in round_candidates if candidate not in next_frontier],
+            },
+        )
+        return round_candidates, next_frontier
 
     def _frontier_from_candidates(self, candidates: list[BeamCandidate]) -> tuple[BeamCandidate, ...]:
         if not candidates:
@@ -482,6 +552,54 @@ class BeamSearchOrchestrator:
             },
         )
         return plan
+
+    def _crow_verdict(
+        self,
+        *,
+        run: RunRecord,
+        goal: str,
+        candidates: tuple[BeamCandidate, ...],
+        frontier: tuple[BeamCandidate, ...],
+        nudge_index: int,
+        command: str,
+        cwd: str,
+    ) -> CrowVerdict:
+        best = max(candidates, key=lambda candidate: candidate.score, default=None)
+        solved = bool(best and best.status == "solved")
+        prompt = build_crow_prompt(
+            goal=goal,
+            candidates=candidates,
+            frontier=frontier,
+            events=self.store.list_events(run, limit=self.config.crow_event_limit),
+            nudge_index=nudge_index,
+        )
+        name = f"crow_{nudge_index}"
+        prompt_path = self.store.write_prompt(run, "crow", name, prompt)
+        result = self.runtime.run_agent(
+            AgentLaunchSpec(
+                name=name,
+                role="crow",
+                command=command,
+                prompt=prompt,
+                cwd=cwd,
+                reuse_session=False,
+                model=self.config.model,
+                effort=self.config.effort,
+            )
+        )
+        response_text = result.stdout if result.stdout.strip() else result.stderr
+        response_path = self.store.write_response(run, "crow", name, response_text)
+        verdict = parse_crow_verdict(response_text, solved=solved)
+        self.store.append_event(
+            run,
+            "crow.nudge",
+            {
+                "prompt_path": str(prompt_path),
+                "response_path": str(response_path),
+                "verdict": asdict(verdict),
+            },
+        )
+        return verdict
 
     def _record_invocation(self, run: RunRecord, candidate: BeamCandidate, result: AgentResult) -> None:
         self.store.append_event(

@@ -45,6 +45,14 @@ class DiversityPlan:
 
 
 @dataclass(frozen=True)
+class CrowVerdict:
+    continue_search: bool
+    message: str
+    reason: str = ""
+    force_depths: int = 1
+
+
+@dataclass(frozen=True)
 class CandidateReport:
     status: str
     summary: str
@@ -169,6 +177,21 @@ class ContextStore:
         path = Path(run.root_dir) / "events.jsonl"
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+    def list_events(self, run: RunRecord, limit: int = 20) -> tuple[dict[str, Any], ...]:
+        path = Path(run.root_dir) / "events.jsonl"
+        if not path.exists():
+            return ()
+        lines = path.read_text(encoding="utf-8").splitlines()
+        events = []
+        for line in lines[-limit:]:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict):
+                events.append(event)
+        return tuple(events)
 
     def write_json(self, path: Path, payload: Any) -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -366,6 +389,57 @@ Return your final message as JSON only:
   """.strip()
 
 
+def build_crow_prompt(
+    *,
+    goal: str,
+    candidates: tuple[BeamCandidate, ...],
+    frontier: tuple[BeamCandidate, ...],
+    events: tuple[dict[str, Any], ...],
+    nudge_index: int,
+) -> str:
+    best = max(candidates, key=lambda candidate: candidate.score, default=None)
+    frontier_lines = [
+        f"- {candidate.id}: status={candidate.status} score={candidate.score:.3f} summary={candidate.summary}"
+        for candidate in frontier
+    ]
+    recent_event_lines = [
+        f"- {event.get('ts', '')} {event.get('kind', '')}: {json.dumps(event.get('payload', {}), ensure_ascii=False)[:700]}"
+        for event in events
+    ]
+    return f"""
+You are Karasu, an independent watchdog over the orchestrator.
+You do not solve the task. You do not inspect the repository. You do not carry
+worker context. You only compare the original user instruction with the
+orchestrator's stopping state.
+
+Original user instruction:
+{goal}
+
+Watchdog nudge count so far: {nudge_index}
+
+Best orchestrator candidate:
+{f"{best.id}: status={best.status} score={best.score:.3f} summary={best.summary}" if best else "none"}
+
+Current frontier:
+{chr(10).join(frontier_lines) if frontier_lines else "- none"}
+
+Recent orchestrator history:
+{chr(10).join(recent_event_lines) if recent_event_lines else "- none"}
+
+If the original instruction is not completely satisfied, force continuation.
+Be terse and relentless. A good message is:
+"全部終わったのですか？終わってないなら続けてください。"
+
+Return JSON only:
+{{
+  "continue_search": true,
+  "message": "short message to the orchestrator",
+  "reason": "why stopping is or is not acceptable",
+  "force_depths": 1
+}}
+  """.strip()
+
+
 def parse_candidate_report(text: str, *, exit_code: int) -> CandidateReport:
     parsed = extract_json_object(text)
     if isinstance(parsed, dict):
@@ -440,6 +514,31 @@ def parse_diversity_plan(text: str, *, fallback: tuple[ThoughtSeed, ...]) -> Div
     return DiversityPlan(
         seeds=tuple(seeds),
         rationale=str(parsed.get("rationale", "")).strip(),
+    )
+
+
+def parse_crow_verdict(text: str, *, solved: bool) -> CrowVerdict:
+    parsed = extract_json_object(text)
+    if isinstance(parsed, dict):
+        force_depths = int(parsed.get("force_depths", 1) or 1)
+        return CrowVerdict(
+            continue_search=bool(parsed.get("continue_search", not solved)),
+            message=str(parsed.get("message", "")).strip()
+            or ("完了していないなら続けてください。" if not solved else "完了を確認しました。"),
+            reason=str(parsed.get("reason", "")).strip(),
+            force_depths=max(1, min(8, force_depths)),
+        )
+    if solved:
+        return CrowVerdict(
+            continue_search=False,
+            message="完了を確認しました。",
+            reason="best candidate reported solved",
+        )
+    return CrowVerdict(
+        continue_search=True,
+        message="全部終わったのですか？終わってないなら続けてください。",
+        reason="crow output was not valid JSON and the best candidate is not solved",
+        force_depths=1,
     )
 
 

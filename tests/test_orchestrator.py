@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 from pawahara_harness.agents import AgentLaunchSpec, AgentResult
-from pawahara_harness.context import parse_candidate_report, parse_diversity_plan, parse_manager_decision
+from pawahara_harness.context import parse_candidate_report, parse_crow_verdict, parse_diversity_plan, parse_manager_decision
 from pawahara_harness.orchestrator import BeamSearchOrchestrator, DiversityDirector, SearchConfig
 
 
@@ -84,6 +84,42 @@ class RoleAwareRuntime:
         )
 
 
+class CrowRuntime:
+    def __init__(self) -> None:
+        self.calls: list[AgentLaunchSpec] = []
+
+    def run_agent(self, spec: AgentLaunchSpec) -> AgentResult:
+        self.calls.append(spec)
+        if spec.role == "crow":
+            stdout = json.dumps(
+                {
+                    "continue_search": True,
+                    "message": "全部終わったのですか？終わってないなら続けてください。",
+                    "reason": "best candidate is not solved",
+                    "force_depths": 1,
+                }
+            )
+        else:
+            stdout = json.dumps(
+                {
+                    "status": "promising",
+                    "summary": f"worker {len([call for call in self.calls if call.role == 'worker'])}",
+                    "score": 0.5,
+                    "next_context": "continue",
+                    "artifacts": [],
+                }
+            )
+        return AgentResult(
+            name=spec.name,
+            role=spec.role,
+            sandbox_id="fake",
+            command=spec.command,
+            stdout=stdout,
+            stderr="",
+            exit_code=0,
+        )
+
+
 def test_parse_candidate_report_reads_fenced_json() -> None:
     report = parse_candidate_report(
         '```json\n{"status":"solved","summary":"done","score":0.95,"next_context":"answer"}\n```',
@@ -113,6 +149,15 @@ def test_parse_diversity_plan_reads_agent_seeds() -> None:
     assert plan.seeds[0].novelty_targets == ("encoding",)
 
 
+def test_parse_crow_verdict_forces_continuation() -> None:
+    verdict = parse_crow_verdict(
+        '{"continue_search":true,"message":"続けてください","reason":"not done","force_depths":2}',
+        solved=False,
+    )
+    assert verdict.continue_search
+    assert verdict.force_depths == 2
+
+
 def test_diversity_director_generates_distinct_seeds() -> None:
     seeds = DiversityDirector().seeds(depth=0, parent=None, count=4)
     assert len(seeds) == 4
@@ -130,6 +175,7 @@ def test_beam_search_orchestrator_prunes_and_persists(tmp_path: Path) -> None:
             max_workers=1,
             stop_on_solved=False,
             agentic_roles=False,
+            crow_enabled=False,
         ),
     )
     orchestrator.store.runs_dir = tmp_path / "runs"
@@ -156,6 +202,7 @@ def test_beam_search_orchestrator_resumes_from_saved_frontier(tmp_path: Path) ->
             max_workers=1,
             stop_on_solved=False,
             agentic_roles=False,
+            crow_enabled=False,
         ),
     )
     first.store.runs_dir = tmp_path / "runs"
@@ -172,6 +219,7 @@ def test_beam_search_orchestrator_resumes_from_saved_frontier(tmp_path: Path) ->
             max_workers=1,
             stop_on_solved=False,
             agentic_roles=False,
+            crow_enabled=False,
         ),
     )
     loaded = first.store.load_run(first_result.run.run_id)
@@ -187,7 +235,7 @@ def test_agentic_roles_drive_manager_and_diversity(tmp_path: Path) -> None:
     runtime = RoleAwareRuntime()
     orchestrator = BeamSearchOrchestrator(
         runtime=runtime,
-        config=SearchConfig(beam_width=1, branch_factor=2, max_depth=1, max_workers=1),
+        config=SearchConfig(beam_width=1, branch_factor=2, max_depth=1, max_workers=1, crow_enabled=False),
     )
     orchestrator.store.runs_dir = tmp_path / "runs"
 
@@ -199,3 +247,28 @@ def test_agentic_roles_drive_manager_and_diversity(tmp_path: Path) -> None:
     assert result.best_candidate.next_context == "graph state"
     assert Path(result.run.root_dir, "roles", "manager.json").exists()
     assert Path(result.run.root_dir, "roles", "diversity.json").exists()
+
+
+def test_crow_watchdog_forces_additional_depth(tmp_path: Path) -> None:
+    runtime = CrowRuntime()
+    orchestrator = BeamSearchOrchestrator(
+        runtime=runtime,
+        config=SearchConfig(
+            beam_width=1,
+            branch_factor=1,
+            max_depth=1,
+            max_workers=1,
+            stop_on_solved=False,
+            agentic_roles=False,
+            crow_enabled=True,
+            crow_max_nudges=1,
+        ),
+    )
+    orchestrator.store.runs_dir = tmp_path / "runs"
+
+    result = orchestrator.run(goal="solve all tasks", command="agent", cwd=str(tmp_path))
+
+    assert [call.role for call in runtime.calls] == ["worker", "crow", "worker"]
+    assert len(result.candidates) == 2
+    assert result.crow_nudges[0].continue_search
+    assert Path(result.run.root_dir, "crow", "crow_0.prompt.md").exists()

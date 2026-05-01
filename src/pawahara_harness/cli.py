@@ -52,6 +52,9 @@ def main(argv: list[str] | None = None) -> int:
     search.add_argument("--drop-raw-worker-outputs", action="store_true")
     search.add_argument("--runs-dir", default=".pawahara/runs")
     search.add_argument("--resume-run", help="Existing run id or run directory to continue.")
+    search.add_argument("--no-crow", action="store_true", help="Disable the independent completion watchdog.")
+    search.add_argument("--crow-max-nudges", type=int, default=3)
+    search.add_argument("--crow-event-limit", type=int, default=20)
     add_cube_bootstrap_arguments(search, prefix="cube-")
 
     cube = subparsers.add_parser("cube", help="Manage local CubeSandbox startup.")
@@ -149,6 +152,9 @@ def main(argv: list[str] | None = None) -> int:
                 reuse_role_sessions=not args.no_role_sessions,
                 model=args.model,
                 effort=args.effort,
+                crow_enabled=not args.no_crow,
+                crow_max_nudges=args.crow_max_nudges,
+                crow_event_limit=args.crow_event_limit,
                 context_policy=ContextPolicy(
                     max_parent_summary_chars=args.max_parent_context_chars,
                     max_worker_output_chars=args.max_worker_context_chars,
