@@ -185,31 +185,33 @@ class PawaharaTui:
             while True:
                 try:
                     line = self._read_line()
+                    if line is None:
+                        return 0
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    self.status_line = f"accepted: {truncate_for_status(stripped)}"
+                    if is_command_line(stripped):
+                        if not self.handle_backslash(stripped):
+                            return 0
+                        continue
+
+                    self.settings.goal = stripped
+                    self._execute_search()
                 except EOFError:
                     print()
                     return 0
                 except KeyboardInterrupt:
-                    self.status_line = "interrupted"
-                    self._clear_rendered_input()
-                    print("\nInterrupted. Use /exit to quit.")
+                    self._handle_interrupt()
                     continue
-
-                if line is None:
-                    return 0
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                self.status_line = f"accepted: {truncate_for_status(stripped)}"
-                if is_command_line(stripped):
-                    if not self.handle_backslash(stripped):
-                        return 0
-                    continue
-
-                self.settings.goal = stripped
-                self._execute_search()
         finally:
             if interactive:
                 self._clear_rendered_input()
+
+    def _handle_interrupt(self) -> None:
+        self.status_line = "interrupted"
+        self._clear_rendered_input()
+        print("\nInterrupted. Use /exit to quit.")
 
     def _interactive_input_enabled(self) -> bool:
         return sys.stdin.isatty() and sys.stdout.isatty()

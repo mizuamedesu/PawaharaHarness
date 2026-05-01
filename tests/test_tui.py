@@ -247,6 +247,18 @@ def test_tui_blocks_missing_host_command_before_fanout() -> None:
     assert "not found in PATH" in error
 
 
+def test_tui_interrupt_handler_returns_to_prompt_without_traceback() -> None:
+    ui = PawaharaTui()
+    output = io.StringIO()
+
+    with redirect_stdout(output):
+        ui._handle_interrupt()
+
+    assert ui.status_line == "interrupted"
+    assert "Interrupted. Use /exit to quit." in output.getvalue()
+    assert "Traceback" not in output.getvalue()
+
+
 def test_tui_inline_input_prompt_marks_goal_as_required() -> None:
     ui = PawaharaTui()
 
