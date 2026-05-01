@@ -4,7 +4,13 @@ import json
 from pathlib import Path
 
 from pawahara_harness.agents import AgentLaunchSpec, AgentResult
-from pawahara_harness.context import parse_candidate_report, parse_crow_verdict, parse_diversity_plan, parse_manager_decision
+from pawahara_harness.context import (
+    HelmDirective,
+    parse_candidate_report,
+    parse_crow_verdict,
+    parse_diversity_plan,
+    parse_manager_decision,
+)
 from pawahara_harness.orchestrator import BeamSearchOrchestrator, DiversityDirector, SearchConfig
 
 
@@ -247,6 +253,41 @@ def test_agentic_roles_drive_manager_and_diversity(tmp_path: Path) -> None:
     assert result.best_candidate.next_context == "graph state"
     assert Path(result.run.root_dir, "roles", "manager.json").exists()
     assert Path(result.run.root_dir, "roles", "diversity.json").exists()
+
+
+def test_helm_steering_is_injected_into_scoped_worker_prompt(tmp_path: Path) -> None:
+    runtime = ScoringRuntime()
+    orchestrator = BeamSearchOrchestrator(
+        runtime=runtime,
+        config=SearchConfig(
+            beam_width=1,
+            branch_factor=1,
+            max_depth=1,
+            max_workers=1,
+            agentic_roles=False,
+            crow_enabled=False,
+            helm_directives=(
+                HelmDirective(
+                    name="ctf-steer",
+                    content="Always build a quick falsification harness before accepting a branch.",
+                    scopes=("worker",),
+                ),
+            ),
+        ),
+    )
+    orchestrator.store.runs_dir = tmp_path / "runs"
+
+    result = orchestrator.run(goal="solve puzzle", command="agent", cwd=str(tmp_path))
+
+    assert runtime.calls
+    assert runtime.calls[0].role == "worker"
+    assert "Helm forced steering" in runtime.calls[0].prompt
+    assert "quick falsification harness" in runtime.calls[0].prompt
+    assert result.best_candidate is not None
+    prompt_text = Path(result.best_candidate.prompt_path).read_text(encoding="utf-8")
+    assert "quick falsification harness" in prompt_text
+    events = orchestrator.store.list_events(result.run, limit=20)
+    assert any(event["kind"] == "helm.injected" for event in events)
 
 
 def test_crow_watchdog_forces_additional_depth(tmp_path: Path) -> None:

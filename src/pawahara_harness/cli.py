@@ -3,10 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from dataclasses import asdict
 from pathlib import Path
 
 from .agents import AgentRuntime, AgentSupervisor, CodexAppServerRuntime, CubeSandboxConfig, CubeSandboxRuntime, LocalCodexRuntime
-from .context import ContextPolicy, ContextStore
+from .context import HELM_ROLES, ContextPolicy, ContextStore, HelmDirective, render_helm_context
 from .cube import DEFAULT_TEMPLATE_IMAGE, CubeBootstrapOptions, CubeBootstrapper, CubeDiagnosis
 from .orchestrator import BeamSearchOrchestrator, SearchConfig
 
@@ -26,6 +27,8 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--cwd")
     run.add_argument("--model")
     run.add_argument("--effort")
+    run.add_argument("--helm", action="append", default=[], help="Force-inject Helm steering text.")
+    run.add_argument("--helm-file", action="append", default=[], help="Force-inject Helm steering from a file.")
     run.add_argument("--seed", action="append", default=[], help="Seed file as sandbox_path=local_path.")
     run.add_argument("--keep-alive", action="store_true")
     add_cube_bootstrap_arguments(run, prefix="cube-")
@@ -55,6 +58,8 @@ def main(argv: list[str] | None = None) -> int:
     search.add_argument("--no-crow", action="store_true", help="Disable the independent completion watchdog.")
     search.add_argument("--crow-max-nudges", type=int, default=3)
     search.add_argument("--crow-event-limit", type=int, default=20)
+    search.add_argument("--helm", action="append", default=[], help="Force-inject Helm steering text.")
+    search.add_argument("--helm-file", action="append", default=[], help="Force-inject Helm steering from a file.")
     add_cube_bootstrap_arguments(search, prefix="cube-")
 
     cube = subparsers.add_parser("cube", help="Manage local CubeSandbox startup.")
@@ -93,8 +98,10 @@ def main(argv: list[str] | None = None) -> int:
 
         supervisor = AgentSupervisor(runtime)
         seed_files = _load_seed_files(args.seed)
+        helm_directives = _load_helm_directives(args.helm, args.helm_file)
+        goal = _inject_helm_for_role(args.goal, role="main", directives=helm_directives)
         result = supervisor.run_main(
-            args.goal,
+            goal,
             args.command,
             cwd=cwd,
             seed_files=seed_files,
@@ -139,6 +146,7 @@ def main(argv: list[str] | None = None) -> int:
             runtime = runtime_or_error
 
         seed_files = _load_seed_files(args.seed)
+        helm_directives = _load_helm_directives(args.helm, args.helm_file)
         orchestrator = BeamSearchOrchestrator(
             runtime=runtime,
             store=store,
@@ -155,6 +163,7 @@ def main(argv: list[str] | None = None) -> int:
                 crow_enabled=not args.no_crow,
                 crow_max_nudges=args.crow_max_nudges,
                 crow_event_limit=args.crow_event_limit,
+                helm_directives=helm_directives,
                 context_policy=ContextPolicy(
                     max_parent_summary_chars=args.max_parent_context_chars,
                     max_worker_output_chars=args.max_worker_context_chars,
@@ -170,6 +179,7 @@ def main(argv: list[str] | None = None) -> int:
             seed_files=seed_files,
             metadata={
                 "backend": args.backend,
+                "helm_directives": [asdict(directive) for directive in helm_directives],
                 "cube_diagnosis": (
                     cube_diagnosis.__dict__
                     | {"environment": cube_diagnosis.environment.as_env() if cube_diagnosis.environment else None}
@@ -306,6 +316,62 @@ def _load_seed_files(entries: list[str]) -> dict[str, bytes]:
         sandbox_path, local_path = entry.split("=", 1)
         files[sandbox_path] = Path(local_path).read_bytes()
     return files
+
+
+def _load_helm_directives(inline_entries: list[str], file_entries: list[str]) -> tuple[HelmDirective, ...]:
+    directives: list[HelmDirective] = []
+    for index, entry in enumerate(inline_entries):
+        scopes, content = _split_helm_scoped_value(entry)
+        if content.strip():
+            directives.append(HelmDirective(name=f"inline_{index}", content=content.strip(), scopes=scopes))
+
+    for index, entry in enumerate(file_entries):
+        scopes, path_text = _split_helm_scoped_value(entry)
+        path = Path(path_text).expanduser()
+        content = path.read_text(encoding="utf-8").strip()
+        if content:
+            directives.append(HelmDirective(name=f"file_{index}:{path.name}", content=content, scopes=scopes))
+    return tuple(directives)
+
+
+def _split_helm_scoped_value(entry: str) -> tuple[tuple[str, ...], str]:
+    prefix, separator, rest = entry.partition(":")
+    if separator:
+        scopes = _parse_helm_scopes(prefix)
+        if scopes is not None:
+            return scopes, rest
+    return HELM_ROLES, entry
+
+
+def _parse_helm_scopes(prefix: str) -> tuple[str, ...] | None:
+    aliases: dict[str, tuple[str, ...]] = {
+        "all": HELM_ROLES,
+        "agent": ("main", "subagent", "worker"),
+        "agents": ("main", "subagent", "worker"),
+        "roles": ("manager", "diversity", "crow"),
+        "orchestrator": ("manager", "diversity", "crow"),
+        "context": ("manager", "diversity", "worker"),
+    }
+    expanded: list[str] = []
+    parts = [part.strip().lower() for part in prefix.split(",") if part.strip()]
+    if not parts:
+        return None
+    for part in parts:
+        if part in aliases:
+            expanded.extend(aliases[part])
+        elif part in HELM_ROLES:
+            expanded.append(part)
+        else:
+            return None
+    deduped = tuple(dict.fromkeys(expanded))
+    return deduped or None
+
+
+def _inject_helm_for_role(prompt: str, *, role: str, directives: tuple[HelmDirective, ...]) -> str:
+    helm_context = render_helm_context(directives, role)
+    if not helm_context:
+        return prompt
+    return f"{helm_context}\n\n---\n\n{prompt}"
 
 
 if __name__ == "__main__":

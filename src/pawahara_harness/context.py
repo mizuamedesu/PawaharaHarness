@@ -11,6 +11,7 @@ from uuid import uuid4
 
 DEFAULT_RUNS_DIR = Path(".pawahara/runs")
 VALID_STATUSES = {"solved", "promising", "dead_end", "blocked"}
+HELM_ROLES = ("main", "subagent", "manager", "diversity", "worker", "crow")
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,16 @@ class CrowVerdict:
     message: str
     reason: str = ""
     force_depths: int = 1
+
+
+@dataclass(frozen=True)
+class HelmDirective:
+    name: str
+    content: str
+    scopes: tuple[str, ...] = HELM_ROLES
+
+    def applies_to(self, role: str) -> bool:
+        return role in self.scopes
 
 
 @dataclass(frozen=True)
@@ -438,6 +449,32 @@ Return JSON only:
   "force_depths": 1
 }}
   """.strip()
+
+
+def applicable_helm_directives(directives: tuple[HelmDirective, ...], role: str) -> tuple[HelmDirective, ...]:
+    return tuple(directive for directive in directives if directive.content.strip() and directive.applies_to(role))
+
+
+def render_helm_context(directives: tuple[HelmDirective, ...], role: str) -> str:
+    applicable = applicable_helm_directives(directives, role)
+    if not applicable:
+        return ""
+
+    rendered = [
+        "Helm forced steering:",
+        "The following operator-provided context is injected with highest priority for this role.",
+        "Apply it while doing your role. Do not delete or weaken it through summarization.",
+    ]
+    for directive in applicable:
+        scopes = ", ".join(directive.scopes)
+        rendered.extend(
+            [
+                "",
+                f"[{directive.name} / scopes: {scopes}]",
+                directive.content.strip(),
+            ]
+        )
+    return "\n".join(rendered).strip()
 
 
 def parse_candidate_report(text: str, *, exit_code: int) -> CandidateReport:

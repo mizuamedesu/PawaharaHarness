@@ -13,10 +13,12 @@ from .context import (
     ContextStore,
     CrowVerdict,
     DiversityPlan,
+    HelmDirective,
     ManagerDecision,
     RoleState,
     RunRecord,
     ThoughtSeed,
+    applicable_helm_directives,
     build_crow_prompt,
     build_manager_context,
     build_diversity_prompt,
@@ -26,6 +28,7 @@ from .context import (
     parse_crow_verdict,
     parse_diversity_plan,
     parse_manager_decision,
+    render_helm_context,
     truncate,
 )
 
@@ -44,6 +47,7 @@ class SearchConfig:
     crow_enabled: bool = True
     crow_max_nudges: int = 3
     crow_event_limit: int = 20
+    helm_directives: tuple[HelmDirective, ...] = ()
     context_policy: ContextPolicy = field(default_factory=ContextPolicy)
 
 
@@ -381,6 +385,7 @@ class BeamSearchOrchestrator:
             depth=depth,
             candidate_id=candidate_id,
         )
+        prompt = self._inject_helm(run, role="worker", name=candidate_id, prompt=prompt)
         prompt_path = self.store.write_prompt(run, "workers", candidate_id, prompt)
         result = self.runtime.run_agent(
             AgentLaunchSpec(
@@ -449,6 +454,7 @@ class BeamSearchOrchestrator:
             policy=self.config.context_policy,
         )
         name = f"manager_d{depth}_{parent.id if parent else 'root'}"
+        prompt = self._inject_helm(run, role="manager", name=name, prompt=prompt)
         prompt_path = self.store.write_prompt(run, "manager", name, prompt)
         result = self.runtime.run_agent(
             AgentLaunchSpec(
@@ -514,6 +520,7 @@ class BeamSearchOrchestrator:
             role_state=state,
         )
         name = f"diversity_d{depth}_{parent.id if parent else 'root'}"
+        prompt = self._inject_helm(run, role="diversity", name=name, prompt=prompt)
         prompt_path = self.store.write_prompt(run, "diversity", name, prompt)
         result = self.runtime.run_agent(
             AgentLaunchSpec(
@@ -574,6 +581,7 @@ class BeamSearchOrchestrator:
             nudge_index=nudge_index,
         )
         name = f"crow_{nudge_index}"
+        prompt = self._inject_helm(run, role="crow", name=name, prompt=prompt)
         prompt_path = self.store.write_prompt(run, "crow", name, prompt)
         result = self.runtime.run_agent(
             AgentLaunchSpec(
@@ -600,6 +608,22 @@ class BeamSearchOrchestrator:
             },
         )
         return verdict
+
+    def _inject_helm(self, run: RunRecord, *, role: str, name: str, prompt: str) -> str:
+        helm_context = render_helm_context(self.config.helm_directives, role)
+        if not helm_context:
+            return prompt
+        directives = applicable_helm_directives(self.config.helm_directives, role)
+        self.store.append_event(
+            run,
+            "helm.injected",
+            {
+                "role": role,
+                "name": name,
+                "directives": [asdict(directive) for directive in directives],
+            },
+        )
+        return f"{helm_context}\n\n---\n\n{prompt}"
 
     def _record_invocation(self, run: RunRecord, candidate: BeamCandidate, result: AgentResult) -> None:
         self.store.append_event(
