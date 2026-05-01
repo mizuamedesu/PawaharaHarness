@@ -27,6 +27,7 @@ BoolParse = Literal["bool", "int", "str"]
 
 CORE_COMMANDS: tuple[tuple[str, str], ...] = (
     ("run", "run the orchestrated harness"),
+    ("resume", "resume a previous run"),
     ("settings", "show current config"),
     ("set", "set a scalar setting"),
     ("unset", "clear model/cwd/resume-run/etc."),
@@ -231,8 +232,8 @@ class PawaharaTui:
             return self._read_line_interactive(prompt)
         return input(self._prompt(prompt))
 
-    def _read_line_interactive(self, prompt: TextPrompt | None = None) -> str | None:
-        buffer: list[str] = []
+    def _read_line_interactive(self, prompt: TextPrompt | None = None, *, initial_text: str = "") -> str | None:
+        buffer: list[str] = list(initial_text)
         selected = 0
         old_settings = termios.tcgetattr(sys.stdin.fileno())
         try:
@@ -243,7 +244,7 @@ class PawaharaTui:
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, new_settings)
             while True:
                 text = "".join(buffer)
-                suggestions = [] if prompt else command_suggestions_for_input(text)
+                suggestions = [] if prompt else self._suggestions_for_input(text)
                 if suggestions:
                     selected = min(selected, len(suggestions) - 1)
                 else:
@@ -259,7 +260,7 @@ class PawaharaTui:
                         self._clear_rendered_input()
                         print(f"{self._prompt(prompt)}{text}")
                         return text
-                    completed = complete_command_input(text, selected)
+                    completed = self._complete_input(text, selected)
                     if completed is not None and completed != "".join(buffer):
                         buffer = list(completed)
                         selected = 0
@@ -282,7 +283,7 @@ class PawaharaTui:
                         selected = 0
                     continue
                 if char == "\t":
-                    completed = complete_command_input("".join(buffer), selected)
+                    completed = self._complete_input("".join(buffer), selected)
                     if completed is not None:
                         buffer = list(completed)
                         selected = 0
@@ -315,7 +316,7 @@ class PawaharaTui:
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_settings)
 
     def _render_composer(self, text: str, selected: int, prompt: TextPrompt | None = None) -> None:
-        suggestions = [] if prompt else command_suggestions_for_input(text)
+        suggestions = [] if prompt else self._suggestions_for_input(text)
         input_prompt = prompt or (None if suggestions else self._input_prompt_for_text(text))
         lines = [
             (
@@ -376,6 +377,14 @@ class PawaharaTui:
         context = argument_context(arg_text)
         if command == "run" and not self.settings.goal:
             return TextPrompt("run", "Type the instruction for the harness.", value=arg_text.strip())
+        if command == "resume":
+            parts = arg_text.split(maxsplit=1)
+            if len(parts) >= 1 and not arg_text.endswith(" "):
+                return None
+            if len(parts) >= 1:
+                value = parts[1].strip() if len(parts) == 2 else ""
+                return TextPrompt("resume", "Type the next message for this run.", value=value)
+            return None
         if command == "set":
             if len(context.parts) >= 1:
                 key = context.parts[0]
@@ -478,6 +487,9 @@ class PawaharaTui:
                 self.settings.goal = raw_rest.strip()
             self._execute_search()
             return True
+        if command == "resume":
+            self._command_resume(raw_rest)
+            return True
         if command == "last":
             self._print_last_payload()
             return True
@@ -494,6 +506,83 @@ class PawaharaTui:
 
         print(f"Unknown command: /{parts[0]}. Use /help.")
         return True
+
+    def _suggestions_for_input(self, text: str) -> list[CommandSuggestion]:
+        parsed = parse_slash_input(text)
+        if parsed and normalize_key(parsed.command_token) == "resume" and parsed.arg_text is not None:
+            return self._resume_run_suggestions(parsed.arg_text)
+        return command_suggestions_for_input(text)
+
+    def _complete_input(self, text: str, selected: int) -> str | None:
+        return complete_command_input(text, selected, suggestions=self._suggestions_for_input(text))
+
+    def _resume_run_suggestions(self, arg_text: str) -> list[CommandSuggestion]:
+        context = argument_context(arg_text)
+        if len(context.parts) > 1 or (len(context.parts) == 1 and context.trailing_space):
+            return []
+        current = context.current
+        runs = ContextStore(Path(self.settings.runs_dir)).list_runs(limit=30)
+        suggestions = tuple(
+            CommandSuggestion(
+                run.run_id,
+                describe_run_for_resume(run),
+                " ",
+            )
+            for run in runs
+        )
+        return filter_suggestions(suggestions, current, normalize_names=False)
+
+    def _command_resume(self, raw_rest: str) -> None:
+        rest = raw_rest.strip()
+        if not rest:
+            selected = self._prompt_resume_command()
+            if selected is None:
+                return
+            self.handle_backslash(selected)
+            return
+        run_ref, _, message = rest.partition(" ")
+        store = ContextStore(Path(self.settings.runs_dir))
+        try:
+            resume_run = store.load_run(run_ref)
+        except RuntimeError as exc:
+            print(str(exc))
+            return
+        if not message.strip():
+            prompted = self._prompt_for_value(
+                "resume",
+                "Type the next message for this run.",
+                usage="Usage: /resume <run-id> <message>",
+            )
+            if prompted is None:
+                return
+            message = prompted
+        self.settings.resume_run = resume_run.run_id
+        self.settings.goal = message.strip()
+        self._execute_search(resume_message=message.strip())
+
+    def _prompt_resume_command(self) -> str | None:
+        store = ContextStore(Path(self.settings.runs_dir))
+        runs = store.list_runs(limit=30)
+        if not runs:
+            print("No previous runs found.")
+            return None
+        if not self._interactive_input_enabled():
+            print("Usage: /resume <run-id> <message>")
+            for run in runs:
+                print(f"  {run.run_id}  {run.goal}")
+            return None
+        previous_status = self.status_line
+        self.status_line = "select resume run"
+        try:
+            line = self._read_line_interactive(initial_text="/resume ")
+        finally:
+            if self.status_line == "select resume run":
+                self.status_line = previous_status
+        if line is None:
+            print("resume: cancelled")
+            return None
+        line = line.strip()
+        return line if is_command_line(line) else f"/{line}"
 
     def _command_set(self, raw_args: str) -> None:
         key, separator, value = raw_args.strip().partition(" ")
@@ -663,10 +752,10 @@ class PawaharaTui:
         setattr(self.settings, spec.attr, value)
         print(f"{spec.attr} = {format_value(value)}")
 
-    def _execute_search(self) -> None:
+    def _execute_search(self, *, resume_message: str | None = None) -> None:
         store = ContextStore(Path(self.settings.runs_dir))
         resume_run = store.load_run(self.settings.resume_run) if self.settings.resume_run else None
-        goal = self.settings.goal or (resume_run.goal if resume_run else "")
+        goal = resume_run.goal if resume_run else self.settings.goal
         if not goal:
             goal = self._prompt_for_value(
                 "run",
@@ -725,6 +814,7 @@ class PawaharaTui:
                 "source": "tui",
             },
             resume_run=resume_run,
+            resume_message=resume_message,
         )
         payload = {"backend": self.settings.backend, **result.as_dict()}
         self.last_payload = payload
@@ -839,6 +929,8 @@ class PawaharaTui:
                 [
                     "Commands:",
                     "  /run <instruction>       run the orchestrated harness",
+                    "  /resume                  choose a previous run, then add the next message",
+                    "  /resume <run-id> <msg>   resume a previous run with a new user turn",
                     "  /set <key> <value>       set any scalar setting",
                     "  /unset <key>             clear nullable settings like model/cwd/resume-run",
                     "  /toggle <key>            flip a boolean setting",
@@ -1124,11 +1216,16 @@ def slash_edit_token(text: str) -> tuple[str, str] | None:
     return parsed.prefix, parsed.command_token
 
 
-def complete_command_input(text: str, selected: int) -> str | None:
+def complete_command_input(
+    text: str,
+    selected: int,
+    *,
+    suggestions: list[CommandSuggestion] | None = None,
+) -> str | None:
     parsed = parse_slash_input(text)
     if parsed is None:
         return None
-    suggestions = command_suggestions_for_input(text)
+    suggestions = command_suggestions_for_input(text) if suggestions is None else suggestions
     if not suggestions:
         return None
     selected = max(0, min(selected, len(suggestions) - 1))
@@ -1321,6 +1418,13 @@ def format_value(value: Any) -> str:
     if isinstance(value, list):
         return json.dumps(value, ensure_ascii=False)
     return str(value)
+
+
+def describe_run_for_resume(run: Any) -> str:
+    status = "finished" if (Path(run.root_dir) / "result.json").exists() else "running"
+    goal = truncate_for_status(str(run.goal).replace("\n", " "), max_chars=52)
+    created = str(run.created_at).replace("T", " ")[:19]
+    return f"{status}  {created}  {goal}"
 
 
 def format_cube_diagnosis(diagnosis: CubeDiagnosis) -> dict[str, Any]:

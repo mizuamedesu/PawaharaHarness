@@ -110,7 +110,9 @@ def test_monitor_page_renders_state_as_trees() -> None:
     page = render_monitor_page()
 
     assert "agentTree" in page
+    assert "treeSvg" in page
     assert "eventTree" in page
+    assert "renderSvgTree" in page
     assert "renderAgentForest" in page
     assert "objectTree" in page
     assert "renderFileTree" in page

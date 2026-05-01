@@ -140,6 +140,19 @@ class ContextStore:
             metadata=dict(data.get("metadata", {})),
         )
 
+    def list_runs(self, limit: int = 20) -> tuple[RunRecord, ...]:
+        if not self.runs_dir.exists():
+            return ()
+        run_dirs = [path for path in self.runs_dir.iterdir() if path.is_dir() and (path / "run.json").exists()]
+        run_dirs.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+        runs: list[RunRecord] = []
+        for run_dir in run_dirs[: max(0, limit)]:
+            try:
+                runs.append(self.load_run(run_dir))
+            except (OSError, KeyError, json.JSONDecodeError, RuntimeError):
+                continue
+        return tuple(runs)
+
     def list_candidates(self, run: RunRecord) -> tuple[BeamCandidate, ...]:
         candidate_dir = Path(run.root_dir) / "candidates"
         if not candidate_dir.exists():

@@ -667,6 +667,13 @@ button { margin: 2px 8px 2px 0; }
 .tree-key { color: #555; font-weight: bold; }
 .tree-branch { margin: 6px 0; }
 .tree-branch > summary { cursor: pointer; }
+.tree-svg { width: 100%; min-height: 360px; border: 1px solid #bbb; background: #fafafa; overflow: auto; }
+.svg-edge { fill: none; stroke: #222; stroke-width: 2; }
+.svg-node rect { stroke: #222; stroke-width: 2; rx: 8; }
+.svg-node text { font-family: sans-serif; font-size: 12px; pointer-events: none; }
+.svg-node.selected rect { stroke-width: 4; }
+.svg-title { font-weight: bold; font-size: 13px; }
+.svg-meta { fill: #555; }
 .node { border: 1px solid #222; margin: 6px 0; padding: 10px; background: #fff; cursor: pointer; }
 .node.selected { outline: 3px solid #444; }
 .node.user { background: #fff8d8; }
@@ -694,6 +701,7 @@ pre { white-space: pre-wrap; overflow: auto; border: 1px solid #ccc; padding: 8p
 <div id="layout">
   <main>
     <h2>Agents</h2>
+    <svg id="treeSvg" class="tree-svg"></svg>
     <div id="agentTree" class="tree"></div>
     <h2>Events</h2>
     <div id="eventTree" class="tree"></div>
@@ -724,6 +732,7 @@ function esc(value) {
 function render(data) {
   currentData = data;
   const summary = document.getElementById('summary');
+  const treeSvg = document.getElementById('treeSvg');
   const agentTree = document.getElementById('agentTree');
   const eventTree = document.getElementById('eventTree');
   const runState = document.getElementById('runState');
@@ -742,6 +751,7 @@ function render(data) {
     result: data.result,
     edges: data.edges,
   }, 'run');
+  renderSvgTree(treeSvg, data.nodes || [], data.edges || []);
   agentTree.innerHTML = renderAgentForest(data.nodes || [], data.edges || []);
   eventTree.innerHTML = renderEventTree(data.events || []);
   renderAllFiles(data.files || []);
@@ -793,6 +803,129 @@ function renderAgentForest(nodes, edges) {
   const orderedRoots = roots.length ? roots : nodes;
   const seen = new Set();
   return orderedRoots.map(node => renderAgentNode(node.id, byId, children, seen)).join('');
+}
+
+function buildTreeIndex(nodes, edges) {
+  const byId = new Map(nodes.map(node => [node.id, node]));
+  const children = new Map();
+  const incoming = new Set();
+  for (const edge of edges) {
+    if (!byId.has(edge.from) || !byId.has(edge.to)) continue;
+    if (!children.has(edge.from)) children.set(edge.from, []);
+    children.get(edge.from).push(edge.to);
+    incoming.add(edge.to);
+  }
+  const roots = nodes.filter(node => !incoming.has(node.id));
+  return { byId, children, roots: roots.length ? roots : nodes };
+}
+
+function renderSvgTree(svg, nodes, edges) {
+  svg.innerHTML = '';
+  const { byId, children, roots } = buildTreeIndex(nodes, edges);
+  const positions = new Map();
+  let row = 0;
+  let maxDepth = 0;
+  const seen = new Set();
+  function visit(nodeId, depth) {
+    if (seen.has(nodeId)) return;
+    seen.add(nodeId);
+    maxDepth = Math.max(maxDepth, depth);
+    const childIds = children.get(nodeId) || [];
+    if (!childIds.length) {
+      positions.set(nodeId, { depth, row: row++ });
+      return;
+    }
+    for (const childId of childIds) visit(childId, depth + 1);
+    const childRows = childIds.map(id => positions.get(id)?.row).filter(value => value !== undefined);
+    const average = childRows.length ? childRows.reduce((a, b) => a + b, 0) / childRows.length : row++;
+    positions.set(nodeId, { depth, row: average });
+  }
+  for (const root of roots) visit(root.id, 0);
+  for (const node of nodes) if (!positions.has(node.id)) visit(node.id, 0);
+
+  const nodeWidth = 210;
+  const nodeHeight = 86;
+  const xGap = 270;
+  const yGap = 132;
+  const margin = 40;
+  const width = Math.max(720, margin * 2 + maxDepth * xGap + nodeWidth);
+  const height = Math.max(360, margin * 2 + Math.max(1, row) * yGap);
+  svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+  svg.setAttribute('height', String(height));
+
+  const point = id => {
+    const pos = positions.get(id) || { depth: 0, row: 0 };
+    return {
+      x: margin + pos.depth * xGap,
+      y: margin + pos.row * yGap,
+    };
+  };
+
+  for (const edge of edges) {
+    if (!positions.has(edge.from) || !positions.has(edge.to)) continue;
+    const from = point(edge.from);
+    const to = point(edge.to);
+    const x1 = from.x + nodeWidth;
+    const y1 = from.y + nodeHeight / 2;
+    const x2 = to.x;
+    const y2 = to.y + nodeHeight / 2;
+    const mid = (x1 + x2) / 2;
+    svg.appendChild(svgEl('path', {
+      class: 'svg-edge',
+      d: `M ${x1} ${y1} C ${mid} ${y1}, ${mid} ${y2}, ${x2} ${y2}`,
+    }));
+  }
+
+  for (const node of nodes) {
+    const pos = point(node.id);
+    const group = svgEl('g', {
+      class: `svg-node ${node.id === selectedNodeId ? 'selected' : ''}`,
+      tabindex: '0',
+    });
+    group.addEventListener('click', () => selectNode(node.id));
+    group.appendChild(svgEl('rect', {
+      x: pos.x,
+      y: pos.y,
+      width: nodeWidth,
+      height: nodeHeight,
+      fill: svgNodeFill(node),
+    }));
+    appendSvgText(group, node.title || node.id, pos.x + 12, pos.y + 24, 'svg-title');
+    appendSvgText(group, `${node.type || ''}  ${node.status || ''}`, pos.x + 12, pos.y + 46, 'svg-meta');
+    const score = node.score === undefined ? '' : `score ${node.score}`;
+    appendSvgText(group, score || shortSvgText(node.body || '', 28), pos.x + 12, pos.y + 68, 'svg-meta');
+    svg.appendChild(group);
+  }
+}
+
+function svgNodeFill(node) {
+  if (node.status === 'solved') return '#c9f6cf';
+  if (node.status === 'blocked' || node.status === 'dead_end') return '#f8caca';
+  if (node.type === 'user') return '#fff8d8';
+  if (node.type === 'manager') return '#eef3ff';
+  if (node.type === 'diversity') return '#edf9ef';
+  if (node.type === 'crow') return '#fff0f0';
+  if (node.status === 'running') return '#fff2b8';
+  return '#f5f5f5';
+}
+
+function svgEl(name, attrs) {
+  const element = document.createElementNS('http://www.w3.org/2000/svg', name);
+  for (const [key, value] of Object.entries(attrs || {})) {
+    element.setAttribute(key, String(value));
+  }
+  return element;
+}
+
+function appendSvgText(group, value, x, y, className) {
+  const text = svgEl('text', { x, y, class: className });
+  text.textContent = shortSvgText(value, 30);
+  group.appendChild(text);
+}
+
+function shortSvgText(value, limit) {
+  value = String(value ?? '').replace(/\\s+/g, ' ').trim();
+  return value.length <= limit ? value : value.slice(0, limit - 1) + '…';
 }
 
 function renderAgentNode(id, byId, children, seen) {

@@ -60,6 +60,7 @@ def main(argv: list[str] | None = None) -> int:
     search.add_argument("--drop-raw-worker-outputs", action="store_true")
     search.add_argument("--runs-dir", default=".pawahara/runs")
     search.add_argument("--resume-run", help="Existing run id or run directory to continue.")
+    search.add_argument("--resume-message", help="Additional user message for a resumed run.")
     search.add_argument("--no-crow", action="store_true", help="Disable the independent completion watchdog.")
     search.add_argument("--crow-max-nudges", type=int, default=3)
     search.add_argument("--crow-event-limit", type=int, default=20)
@@ -204,6 +205,7 @@ def main(argv: list[str] | None = None) -> int:
                 ),
             },
             resume_run=resume_run,
+            resume_message=args.resume_message,
         )
         print(json.dumps({"backend": args.backend, **result.as_dict()}, ensure_ascii=False, indent=2))
         return 0

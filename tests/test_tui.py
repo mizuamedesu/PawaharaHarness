@@ -5,6 +5,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 
 from pawahara_harness.cli import DEFAULT_CODEX_COMMAND
+from pawahara_harness.context import ContextStore
 from pawahara_harness.tui import (
     ANSI_CURRENT_LINE,
     ANSI_RESET,
@@ -193,6 +194,28 @@ def test_tui_run_with_value_dispatches_harness() -> None:
 
     assert ui.handle_backslash("/run solve every task")
     assert calls == ["solve every task"]
+
+
+def test_tui_resume_suggests_previous_runs_and_dispatches_message(tmp_path: Path) -> None:
+    store = ContextStore(tmp_path / "runs")
+    run = store.create_run("solve old task")
+    ui = PawaharaTui()
+    ui.settings.runs_dir = str(store.runs_dir)
+    calls: list[tuple[str | None, str | None]] = []
+
+    suggestions = ui._suggestions_for_input("/resume ")
+    assert suggestions
+    assert suggestions[0].name == run.run_id
+    assert complete_command_input("/resume ", 0, suggestions=suggestions) == f"/resume {run.run_id} "
+
+    def fake_execute_search(*, resume_message: str | None = None) -> None:
+        calls.append((ui.settings.resume_run, resume_message))
+
+    ui._execute_search = fake_execute_search  # type: ignore[method-assign]
+
+    assert ui.handle_backslash(f"/resume {run.run_id} continue from here")
+    assert calls == [(run.run_id, "continue from here")]
+    assert ui.settings.goal == "continue from here"
 
 
 def test_tui_search_command_is_not_an_alias() -> None:

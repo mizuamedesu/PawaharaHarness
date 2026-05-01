@@ -237,6 +237,53 @@ def test_beam_search_orchestrator_resumes_from_saved_frontier(tmp_path: Path) ->
     assert max(candidate.depth for candidate in resumed.candidates) == 1
 
 
+def test_resume_message_is_recorded_and_passed_to_workers(tmp_path: Path) -> None:
+    first_runtime = ScoringRuntime()
+    first = BeamSearchOrchestrator(
+        runtime=first_runtime,
+        config=SearchConfig(
+            beam_width=1,
+            branch_factor=1,
+            max_depth=1,
+            max_workers=1,
+            stop_on_solved=False,
+            agentic_roles=False,
+            crow_enabled=False,
+        ),
+    )
+    first.store.runs_dir = tmp_path / "runs"
+    first_result = first.run(goal="solve puzzle", command="agent", cwd=str(tmp_path))
+
+    second_runtime = ScoringRuntime()
+    second = BeamSearchOrchestrator(
+        runtime=second_runtime,
+        store=first.store,
+        config=SearchConfig(
+            beam_width=1,
+            branch_factor=1,
+            max_depth=1,
+            max_workers=1,
+            stop_on_solved=False,
+            agentic_roles=False,
+            crow_enabled=False,
+        ),
+    )
+    loaded = first.store.load_run(first_result.run.run_id)
+    second.run(
+        goal=loaded.goal,
+        command="agent",
+        cwd=str(tmp_path),
+        resume_run=loaded,
+        resume_message="try the parser branch now",
+    )
+
+    assert second_runtime.calls
+    assert "Latest resume message from the user" in second_runtime.calls[0].prompt
+    assert "try the parser branch now" in second_runtime.calls[0].prompt
+    events = first.store.list_events(loaded, limit=50)
+    assert any(event["kind"] == "conversation.message" for event in events)
+
+
 def test_agentic_roles_drive_manager_and_diversity(tmp_path: Path) -> None:
     runtime = RoleAwareRuntime()
     orchestrator = BeamSearchOrchestrator(

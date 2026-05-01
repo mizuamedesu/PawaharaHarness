@@ -161,6 +161,7 @@ class BeamSearchOrchestrator:
         seed_files: dict[str, str | bytes] | None = None,
         metadata: dict[str, Any] | None = None,
         resume_run: RunRecord | None = None,
+        resume_message: str | None = None,
     ) -> SearchResult:
         if resume_run:
             run = resume_run
@@ -168,26 +169,39 @@ class BeamSearchOrchestrator:
             all_candidates = previous_candidates[:]
             frontier = self._frontier_from_candidates(previous_candidates)
             start_depth = (max((candidate.depth for candidate in previous_candidates), default=-1) + 1)
+            effective_goal = self._resume_goal(run.goal, resume_message)
             self.store.append_event(
                 run,
                 "run.resumed",
                 {
-                    "goal": goal,
+                    "goal": run.goal,
+                    "resume_message": resume_message or "",
                     "metadata": metadata or {},
                     "start_depth": start_depth,
                     "frontier": [candidate.id for candidate in frontier],
                 },
             )
+            if resume_message:
+                self.store.append_event(
+                    run,
+                    "conversation.message",
+                    {
+                        "role": "user",
+                        "content": resume_message,
+                        "start_depth": start_depth,
+                    },
+                )
         else:
             run = self.store.create_run(goal, metadata=metadata)
             frontier = ()
             all_candidates = []
             start_depth = 0
+            effective_goal = goal
 
         for depth in range(start_depth, start_depth + self.config.max_depth):
             round_candidates, frontier = self._run_depth(
                 run=run,
-                goal=goal,
+                goal=effective_goal,
                 command=command,
                 cwd=cwd,
                 depth=depth,
@@ -209,7 +223,7 @@ class BeamSearchOrchestrator:
                     break
                 verdict = self._crow_verdict(
                     run=run,
-                    goal=goal,
+                    goal=effective_goal,
                     candidates=tuple(all_candidates),
                     frontier=frontier,
                     nudge_index=nudge_index,
@@ -223,7 +237,7 @@ class BeamSearchOrchestrator:
                 for _ in range(verdict.force_depths):
                     round_candidates, frontier = self._run_depth(
                         run=run,
-                        goal=goal,
+                        goal=effective_goal,
                         command=command,
                         cwd=cwd,
                         depth=next_depth,
@@ -247,6 +261,23 @@ class BeamSearchOrchestrator:
         )
         self.store.write_json(Path(run.root_dir) / "result.json", result.as_dict())
         return result
+
+    def _resume_goal(self, original_goal: str, resume_message: str | None) -> str:
+        if not resume_message:
+            return original_goal
+        return "\n".join(
+            [
+                "Original user instruction:",
+                original_goal,
+                "",
+                "Latest resume message from the user:",
+                resume_message.strip(),
+                "",
+                "Continue the existing run. Use the stored frontier, role memory, prior events, and candidate contexts as",
+                "the conversation history. Treat the latest resume message as the current user turn, not as a replacement",
+                "for the original instruction.",
+            ]
+        ).strip()
 
     def _run_depth(
         self,
