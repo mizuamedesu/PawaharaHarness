@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import io
 from contextlib import redirect_stdout
+from pathlib import Path
 
+from pawahara_harness.cli import DEFAULT_CODEX_COMMAND
 from pawahara_harness.tui import (
     ANSI_CURRENT_LINE,
     ANSI_RESET,
@@ -14,6 +16,7 @@ from pawahara_harness.tui import (
     is_command_line,
     parse_bool,
     parse_escape_action,
+    resolve_host_command,
     visible_suggestions,
 )
 
@@ -200,6 +203,48 @@ def test_tui_search_command_is_not_an_alias() -> None:
         assert ui.handle_backslash("/search solve every task")
 
     assert "Unknown command: /search" in output.getvalue()
+
+
+def test_tui_resolves_discovered_codex_command() -> None:
+    resolved, error = resolve_host_command(
+        "codex exec --json",
+        which=lambda _name: None,
+        discover_codex=lambda: Path("/opt/codex/bin/codex"),
+    )
+
+    assert error is None
+    assert resolved == "/opt/codex/bin/codex exec --json"
+
+
+def test_tui_rewrites_legacy_codex_approval_flag() -> None:
+    resolved, error = resolve_host_command(
+        "codex exec --skip-git-repo-check --sandbox workspace-write --approval-policy never",
+        which=lambda _name: None,
+        discover_codex=lambda: Path("/opt/codex/bin/codex"),
+    )
+
+    assert error is None
+    assert resolved == (
+        "/opt/codex/bin/codex --ask-for-approval never "
+        "exec --skip-git-repo-check --sandbox workspace-write"
+    )
+
+
+def test_default_codex_command_uses_current_cli_approval_flag() -> None:
+    assert "--approval-policy" not in DEFAULT_CODEX_COMMAND
+    assert DEFAULT_CODEX_COMMAND.startswith("codex --ask-for-approval never exec ")
+
+
+def test_tui_blocks_missing_host_command_before_fanout() -> None:
+    resolved, error = resolve_host_command(
+        "codex exec --json",
+        which=lambda _name: None,
+        discover_codex=lambda: None,
+    )
+
+    assert resolved == "codex exec --json"
+    assert error is not None
+    assert "not found in PATH" in error
 
 
 def test_tui_inline_input_prompt_marks_goal_as_required() -> None:

@@ -12,7 +12,7 @@ from .cube import DEFAULT_TEMPLATE_IMAGE, CubeBootstrapOptions, CubeBootstrapper
 from .orchestrator import BeamSearchOrchestrator, SearchConfig
 
 
-DEFAULT_CODEX_COMMAND = "codex exec --skip-git-repo-check --sandbox workspace-write --approval-policy never"
+DEFAULT_CODEX_COMMAND = "codex --ask-for-approval never exec --skip-git-repo-check --sandbox workspace-write"
 
 
 def main(argv: list[str] | None = None) -> int:

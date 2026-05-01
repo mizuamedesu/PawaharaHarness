@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 import shlex
+import shutil
 import sys
 import termios
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from .agents import AgentRuntime, CubeSandboxConfig, CubeSandboxRuntime
 from .cli import (
@@ -663,6 +664,8 @@ class PawaharaTui:
             if goal is None:
                 return
             self.settings.goal = goal
+        if not self._prepare_local_agent_commands():
+            return
         self.status_line = "running run"
         print("running run...")
         prepared = self._prepare_runtime()
@@ -731,6 +734,28 @@ class PawaharaTui:
         except RuntimeError as exc:
             print(f"{self.settings.backend}: {exc}")
             return None
+
+    def _prepare_local_agent_commands(self) -> bool:
+        if self.settings.backend != "codex":
+            return True
+        resolved, error = resolve_host_command(self.settings.command)
+        if error:
+            self.status_line = "run blocked: command missing"
+            print(error)
+            return False
+        if resolved != self.settings.command:
+            self.settings.command = resolved
+            print(f"command = {resolved}")
+        if self.settings.role_command:
+            resolved_role, role_error = resolve_host_command(self.settings.role_command)
+            if role_error:
+                self.status_line = "run blocked: role command missing"
+                print(role_error)
+                return False
+            if resolved_role != self.settings.role_command:
+                self.settings.role_command = resolved_role
+                print(f"role_command = {resolved_role}")
+        return True
 
     def _cube_namespace(self) -> Any:
         class CubeArgs:
@@ -1124,6 +1149,83 @@ def highlight_prompt(value: str) -> str:
 
 def format_prompt_line(prompt: str, text: str) -> str:
     return f"{highlight_prompt(prompt)}{text}"
+
+
+def resolve_host_command(
+    command: str,
+    *,
+    which: Callable[[str], str | None] = shutil.which,
+    discover_codex: Callable[[], Path | None] | None = None,
+) -> tuple[str, str | None]:
+    try:
+        parts = shlex.split(command)
+    except ValueError as exc:
+        return command, f"Could not parse agent command: {exc}"
+    if not parts:
+        return command, "Agent command is empty. Set it with /command <shell command>."
+
+    executable = parts[0]
+    if "/" in executable:
+        if Path(executable).exists():
+            return normalize_codex_exec_command(parts), None
+        return command, f"Agent command executable not found: {executable}"
+
+    if which(executable):
+        return normalize_codex_exec_command(parts), None
+
+    if executable == "codex":
+        codex_path = (discover_codex or discover_codex_cli)()
+        if codex_path:
+            return normalize_codex_exec_command((str(codex_path), *parts[1:])), None
+
+    return command, (
+        f"Agent command executable `{executable}` was not found in PATH.\n"
+        f"Current command: {command}\n"
+        "Use /backend codex-sdk, or set an absolute command with /command <path-to-codex> exec ..."
+    )
+
+
+def normalize_codex_exec_command(parts: tuple[str, ...] | list[str]) -> str:
+    if not parts:
+        return ""
+    normalized = list(parts)
+    executable = Path(normalized[0]).name
+    if executable != "codex" or "exec" not in normalized:
+        return shell_join(tuple(normalized))
+    if "--ask-for-approval" in normalized or "-a" in normalized:
+        return shell_join(tuple(normalized))
+    if "--approval-policy" not in normalized:
+        return shell_join(tuple(normalized))
+
+    policy_index = normalized.index("--approval-policy")
+    if policy_index + 1 >= len(normalized):
+        return shell_join(tuple(normalized))
+    policy = normalized[policy_index + 1]
+    del normalized[policy_index : policy_index + 2]
+    exec_index = normalized.index("exec")
+    normalized[exec_index:exec_index] = ["--ask-for-approval", policy]
+    return shell_join(tuple(normalized))
+
+
+def discover_codex_cli() -> Path | None:
+    found = shutil.which("codex")
+    if found:
+        return Path(found)
+    candidates: list[Path] = []
+    vscode_extensions = Path.home() / ".vscode" / "extensions"
+    if vscode_extensions.exists():
+        candidates.extend(vscode_extensions.glob("openai.chatgpt-*/bin/*/codex"))
+    cursor_extensions = Path.home() / ".cursor" / "extensions"
+    if cursor_extensions.exists():
+        candidates.extend(cursor_extensions.glob("openai.chatgpt-*/bin/*/codex"))
+    existing = [candidate for candidate in candidates if candidate.exists()]
+    if not existing:
+        return None
+    return max(existing, key=lambda path: path.stat().st_mtime)
+
+
+def shell_join(parts: tuple[str, ...]) -> str:
+    return " ".join(shlex.quote(part) for part in parts)
 
 
 def setting_requires_value(spec: SettingSpec) -> bool:
