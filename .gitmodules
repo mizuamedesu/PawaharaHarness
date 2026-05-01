@@ -1,0 +1,6 @@
+[submodule "codex"]
+	path = codex
+	url = https://github.com/openai/codex.git
+[submodule "CubeSandbox"]
+	path = CubeSandbox
+	url = https://github.com/TencentCloud/CubeSandbox.git
