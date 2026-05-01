@@ -387,6 +387,18 @@ class BeamSearchOrchestrator:
         )
         prompt = self._inject_helm(run, role="worker", name=candidate_id, prompt=prompt)
         prompt_path = self.store.write_prompt(run, "workers", candidate_id, prompt)
+        self.store.append_event(
+            run,
+            "worker.started",
+            {
+                "candidate": candidate_id,
+                "depth": depth,
+                "index": index,
+                "parent": parent.id if parent else None,
+                "seed": asdict(seed),
+                "prompt_path": str(prompt_path),
+            },
+        )
         result = self.runtime.run_agent(
             AgentLaunchSpec(
                 name=candidate_id,
@@ -456,6 +468,16 @@ class BeamSearchOrchestrator:
         name = f"manager_d{depth}_{parent.id if parent else 'root'}"
         prompt = self._inject_helm(run, role="manager", name=name, prompt=prompt)
         prompt_path = self.store.write_prompt(run, "manager", name, prompt)
+        self.store.append_event(
+            run,
+            "manager.started",
+            {
+                "name": name,
+                "depth": depth,
+                "parent": parent.id if parent else None,
+                "prompt_path": str(prompt_path),
+            },
+        )
         result = self.runtime.run_agent(
             AgentLaunchSpec(
                 name=name,
@@ -485,11 +507,18 @@ class BeamSearchOrchestrator:
             run,
             "manager.decision",
             {
+                "name": name,
                 "depth": depth,
                 "parent": parent.id if parent else None,
                 "prompt_path": str(prompt_path),
                 "response_path": str(response_path),
                 "decision": asdict(decision),
+                "invocation": {
+                    "exit_code": result.exit_code,
+                    "sandbox_id": result.sandbox_id,
+                    "command": result.command,
+                    "session_id": result.session_id,
+                },
             },
         )
         return decision
@@ -522,6 +551,16 @@ class BeamSearchOrchestrator:
         name = f"diversity_d{depth}_{parent.id if parent else 'root'}"
         prompt = self._inject_helm(run, role="diversity", name=name, prompt=prompt)
         prompt_path = self.store.write_prompt(run, "diversity", name, prompt)
+        self.store.append_event(
+            run,
+            "diversity.started",
+            {
+                "name": name,
+                "depth": depth,
+                "parent": parent.id if parent else None,
+                "prompt_path": str(prompt_path),
+            },
+        )
         result = self.runtime.run_agent(
             AgentLaunchSpec(
                 name=name,
@@ -551,11 +590,18 @@ class BeamSearchOrchestrator:
             run,
             "diversity.plan",
             {
+                "name": name,
                 "depth": depth,
                 "parent": parent.id if parent else None,
                 "prompt_path": str(prompt_path),
                 "response_path": str(response_path),
                 "plan": asdict(plan),
+                "invocation": {
+                    "exit_code": result.exit_code,
+                    "sandbox_id": result.sandbox_id,
+                    "command": result.command,
+                    "session_id": result.session_id,
+                },
             },
         )
         return plan
@@ -583,6 +629,15 @@ class BeamSearchOrchestrator:
         name = f"crow_{nudge_index}"
         prompt = self._inject_helm(run, role="crow", name=name, prompt=prompt)
         prompt_path = self.store.write_prompt(run, "crow", name, prompt)
+        self.store.append_event(
+            run,
+            "crow.started",
+            {
+                "name": name,
+                "nudge_index": nudge_index,
+                "prompt_path": str(prompt_path),
+            },
+        )
         result = self.runtime.run_agent(
             AgentLaunchSpec(
                 name=name,
@@ -602,9 +657,17 @@ class BeamSearchOrchestrator:
             run,
             "crow.nudge",
             {
+                "name": name,
+                "nudge_index": nudge_index,
                 "prompt_path": str(prompt_path),
                 "response_path": str(response_path),
                 "verdict": asdict(verdict),
+                "invocation": {
+                    "exit_code": result.exit_code,
+                    "sandbox_id": result.sandbox_id,
+                    "command": result.command,
+                    "session_id": result.session_id,
+                },
             },
         )
         return verdict

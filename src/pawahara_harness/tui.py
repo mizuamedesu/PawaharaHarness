@@ -125,6 +125,9 @@ class TuiSettings:
     cube_wait_seconds: int = 900
     cube_install: bool = True
     cube_create_template: bool = True
+    web_enabled: bool = True
+    web_host: str = "127.0.0.1"
+    web_port: int = 8765
 
 
 SETTING_SPECS: dict[str, SettingSpec] = {
@@ -168,6 +171,11 @@ SETTING_SPECS: dict[str, SettingSpec] = {
     "cube_no_install": SettingSpec("cube_install", "bool", inverted=True),
     "cube_create_template": SettingSpec("cube_create_template", "bool"),
     "cube_no_create_template": SettingSpec("cube_create_template", "bool", inverted=True),
+    "web_enabled": SettingSpec("web_enabled", "bool"),
+    "web": SettingSpec("web_enabled", "bool"),
+    "no_web": SettingSpec("web_enabled", "bool", inverted=True),
+    "web_host": SettingSpec("web_host", "str"),
+    "web_port": SettingSpec("web_port", "int"),
 }
 
 
@@ -177,6 +185,7 @@ class PawaharaTui:
         self.last_payload: dict[str, Any] | None = None
         self.status_line = "idle"
         self._rendered_lines = 0
+        self.monitor_server: Any | None = None
 
     def run_loop(self) -> int:
         interactive = self._interactive_input_enabled()
@@ -207,6 +216,7 @@ class PawaharaTui:
         finally:
             if interactive:
                 self._clear_rendered_input()
+            self._stop_monitor_server()
 
     def _handle_interrupt(self) -> None:
         self.status_line = "interrupted"
@@ -668,6 +678,7 @@ class PawaharaTui:
             self.settings.goal = goal
         if not self._prepare_local_agent_commands():
             return
+        self._ensure_monitor_server(store.runs_dir)
         self.status_line = "running run"
         print("running run...")
         prepared = self._prepare_runtime()
@@ -736,6 +747,35 @@ class PawaharaTui:
         except RuntimeError as exc:
             print(f"{self.settings.backend}: {exc}")
             return None
+
+    def _ensure_monitor_server(self, runs_dir: Path) -> None:
+        if not self.settings.web_enabled:
+            return
+        if self.monitor_server is not None:
+            if Path(self.monitor_server.runs_dir) == Path(runs_dir):
+                print(f"agent monitor: {self.monitor_server.url}")
+                return
+            self._stop_monitor_server()
+        from .web import AgentMonitorServer
+
+        try:
+            self.monitor_server = AgentMonitorServer(
+                runs_dir=Path(runs_dir),
+                host=self.settings.web_host,
+                port=self.settings.web_port,
+            ).start()
+        except RuntimeError as exc:
+            self.status_line = "monitor failed"
+            print(str(exc))
+            return
+        self.settings.web_port = self.monitor_server.port
+        print(f"agent monitor: {self.monitor_server.url}")
+
+    def _stop_monitor_server(self) -> None:
+        if self.monitor_server is None:
+            return
+        self.monitor_server.stop()
+        self.monitor_server = None
 
     def _prepare_local_agent_commands(self) -> bool:
         if self.settings.backend != "codex":
