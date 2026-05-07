@@ -116,9 +116,24 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG_NAME: ${{ github.ref_name }}
         run: |
-          files=$(find release-artifacts -type f | sort)
-          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
-            gh release upload "$TAG_NAME" $files --clobber
+          mapfile -t files < <(find release-artifacts -type f | sort)
+          if gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG_NAME" "${files[@]}" --clobber --repo "$GITHUB_REPOSITORY"
           else
-            gh release create "$TAG_NAME" $files --title "$TAG_NAME" --generate-notes
+            gh release create "$TAG_NAME" "${files[@]}" --title "$TAG_NAME" --generate-notes --repo "$GITHUB_REPOSITORY"
           fi
+
+  test-linux-installer:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install from release with Linux script
+        env:
+          PAWAHARA_VERSION: ${{ github.ref_name }}
+          PAWAHARA_INSTALL_DIR: ${{ runner.temp }}/pawahara-bin
+        run: |
+          bash install.sh
+          "$PAWAHARA_INSTALL_DIR/pawahara-harness" --help
