@@ -13,6 +13,7 @@ on:
       - "install.sh"
       - "pyproject.toml"
       - "scripts/build_binary.py"
+      - "skills/**"
       - "src/**"
       - "tests/**"
 
@@ -137,3 +138,7 @@ jobs:
         run: |
           bash install.sh
           "$PAWAHARA_INSTALL_DIR/pawahara-harness" --help
+          test -f "$HOME/.codex/skills/pawahara-harness/SKILL.md"
+          test -f "$HOME/.claude/skills/pawahara-harness/SKILL.md"
+          grep -q "pawahara-harness search" "$HOME/.codex/skills/pawahara-harness/SKILL.md"
+          grep -q "pawahara-harness search" "$HOME/.claude/skills/pawahara-harness/SKILL.md"

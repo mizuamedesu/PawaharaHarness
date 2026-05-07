@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pawahara-harness"
-version = "0.1.1"
+version = "0.1.2"
 description = "Context-managed Codex agent search harness with optional CubeSandbox."
 requires-python = ">=3.11"
 dependencies = [
